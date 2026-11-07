@@ -39,8 +39,9 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.sync {
                 if which == "phones" { self.showDevicesWindow?() }
                 if which == "settings" { self.showSettingsWindow?() }
+                if which == "toolbar" { self.windowController?.ui.toolbarVisible = true }
                 RunLoop.current.run(until: Date().addingTimeInterval(0.6))
-                let w: NSWindow? = which == "mirror" ? self.windowController?.window
+                let w: NSWindow? = (which == "mirror" || which == "toolbar") ? self.windowController?.window
                     : NSApp.windows.first { $0.title.lowercased().contains(which.lowercased()) && $0.isVisible }
                 guard let w else { return nil }
                 return WindowCapture.png(windowID: CGWindowID(w.windowNumber))

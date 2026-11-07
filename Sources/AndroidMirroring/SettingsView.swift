@@ -1,6 +1,7 @@
 import AgentProtocol
 import AppKit
 import MirrorKit
+import ServiceManagement
 import SwiftUI
 
 struct SettingsView: View {
@@ -28,9 +29,20 @@ private struct GeneralSettings: View {
     @AppStorage("trackpadAsTouch") private var trackpadAsTouch = true
     @AppStorage("stayAwake") private var stayAwake = false
     @StateObject private var pin = Box(Keychain.pin ?? "")
+    @StateObject private var loginItem = Box(SMAppService.mainApp.status == .enabled)
 
     var body: some View {
         Form {
+            Section {
+                Toggle("Open at login (keeps your phone available to you and your agents)", isOn: $loginItem.value)
+                    .onChange(of: loginItem.value) { _, on in
+                        do {
+                            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                        } catch {
+                            Log.warn("login item: \(error)")
+                        }
+                    }
+            }
             Section {
                 Toggle("Share clipboard between Mac and phone", isOn: $clipboardSync)
                 Toggle("Show phone notifications on this Mac", isOn: $forwardNotifications)

@@ -293,6 +293,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 // If launched from a throttled (background-role) process, leave the background band so
 // decode, gesture timing and agent calls are not delayed.
 setpriority(PRIO_DARWIN_PROCESS, 0, 0)
+// Deliver every mouse / trackpad event instead of one per display refresh: denser touch paths give
+// Android's input resampling more to work with (smoother drags), and the relay keeps their spacing.
+NSEvent.isMouseCoalescingEnabled = false
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

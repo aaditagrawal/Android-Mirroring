@@ -53,5 +53,10 @@ let package = Package(
             dependencies: ["MirrorKit"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .testTarget(
+            name: "MirrorKitTests",
+            dependencies: ["MirrorKit", "AgentProtocol"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

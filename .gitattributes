@@ -1,0 +1,9 @@
+* text=auto
+*.swift text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.java text eol=lf
+*.yml text eol=lf
+*.png binary
+*.jar binary
+Resources/scrcpy-server binary

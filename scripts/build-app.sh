@@ -5,6 +5,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+case "${1:-}" in
+  ""|--install|--homebrew) ;;
+  --help|-h) echo "Usage: scripts/build-app.sh [--install|--homebrew]"; exit 0 ;;
+  *) echo "Unknown option: $1" >&2; exit 2 ;;
+esac
+
+# Homebrew supplies its own sandbox. SwiftPM must not create a nested sandbox.
+SWIFT_OPTIONS=(--configuration release)
+if [ "${1:-}" = "--homebrew" ]; then SWIFT_OPTIONS+=(--disable-sandbox); fi
+scripts/check-resources.sh
+
 APP_NAME="Android Mirroring"
 BUNDLE_ID="com.aaditagrawal.AndroidMirroring"
 VERSION="1.0.0"
@@ -12,9 +23,9 @@ BUILD_DIR="build"
 APP="$BUILD_DIR/$APP_NAME.app"
 
 echo "▸ Compiling (release)…"
-swift build -c release --product AndroidMirroring
-swift build -c release --product droidctl
-BIN="$(swift build -c release --show-bin-path)"
+swift build "${SWIFT_OPTIONS[@]}" --product AndroidMirroring
+swift build "${SWIFT_OPTIONS[@]}" --product droidctl
+BIN="$(swift build "${SWIFT_OPTIONS[@]}" --show-bin-path)"
 
 echo "▸ Assembling bundle…"
 rm -rf "$APP"
@@ -22,7 +33,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/AndroidMirroring" "$APP/Contents/MacOS/AndroidMirroring"
 cp "$BIN/droidctl" "$APP/Contents/MacOS/droidctl"
 cp Resources/scrcpy-server "$APP/Contents/Resources/scrcpy-server"
+cp Resources/relay.jar "$APP/Contents/Resources/relay.jar"
 cp Resources/scrcpy-LICENSE "$APP/Contents/Resources/scrcpy-LICENSE"
+cp LICENSE THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/"
 
 if [ ! -f "$BUILD_DIR/AppIcon.icns" ] || [ scripts/make-icon.swift -nt "$BUILD_DIR/AppIcon.icns" ]; then
   echo "▸ Rendering icon…"

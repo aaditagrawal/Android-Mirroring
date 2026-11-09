@@ -15,21 +15,6 @@ public enum MirrorState: Equatable, Sendable {
     }
 }
 
-/// User-tunable settings (backed by UserDefaults so the Settings UI binds directly).
-public struct MirrorSettings {
-    static var d: UserDefaults { .standard }
-    public static var quality: String { d.string(forKey: "quality") ?? "auto" }      // auto | high | balanced | data
-    public static var codec: String { d.string(forKey: "codec") ?? "h265" }
-    public static var maxFps: Int { d.object(forKey: "maxFps") as? Int ?? 60 }
-    public static var audio: Bool { d.object(forKey: "audio") as? Bool ?? true }
-    public static var clipboardSync: Bool { d.object(forKey: "clipboardSync") as? Bool ?? true }
-    public static var screenOffWhileMirroring: Bool { d.object(forKey: "screenOff") as? Bool ?? false }
-    public static var stayAwake: Bool { d.object(forKey: "stayAwake") as? Bool ?? false }
-    public static var showTouches: Bool { d.object(forKey: "showTouches") as? Bool ?? false }
-    public static var autoSwitchPaths: Bool { d.object(forKey: "autoSwitchPaths") as? Bool ?? true }
-    public static var lockPhoneOnDisconnect: Bool { d.object(forKey: "lockOnDisconnect") as? Bool ?? false }
-}
-
 public final class MirrorController: ObservableObject, @unchecked Sendable {
     @Published public private(set) var state: MirrorState = .idle
     @Published public private(set) var device: PhoneDevice?
@@ -42,13 +27,13 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
     public let frames = FrameStore()
     public var adb: ADBClient { devices.adb }
 
-    /// Called on the decoder thread for each decoded frame (the view enqueues it for display).
-    public var displaySink: ((CVPixelBuffer) -> Void)?
+    /// Called on the decoder thread for each decoded frame (the view schedules it for display).
+    public var displaySink: ((DecodedFrame) -> Void)?
 
     private let sessionLock = NSLock()
     private var _session: ScrcpySession?
     /// Accessed from the main thread, agent threads and decoder threads: lock-protected.
-    private var session: ScrcpySession? {
+    public internal(set) var session: ScrcpySession? {
         get { sessionLock.lock(); defer { sessionLock.unlock() }; return _session }
         set { sessionLock.lock(); _session = newValue; sessionLock.unlock() }
     }
@@ -70,7 +55,12 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
     /// True when no usable transport exists: the next device-list change may start a session.
     /// (Otherwise retries are driven only by `scheduleReconnect`'s backoff, never by list churn.)
     private var waitingForDevice = false
-    private var reconnectScheduled = false
+    /// Generation that scheduled the pending retry (nil = none pending).
+    private var reconnectGeneration: Int?
+    private var reconnectScheduled: Bool { reconnectGeneration == generation }
+    /// Transports that recently failed to start a stream; not eligible for automatic upgrades.
+    private var startFailures: [String: Date] = [:]
+    private var clipboardRequestId = 0
 
     public init(devices: DeviceManager) {
         self.devices = devices
@@ -91,7 +81,7 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
             wantedDeviceId = deviceId
             devices.focusDeviceId = deviceId
             reconnectAttempt = 0
-            reconnectScheduled = false
+            reconnectGeneration = nil
             if let d = devices.device(id: deviceId) {
                 device = d
                 waitingForDevice = false
@@ -161,19 +151,53 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
             o = StreamOptions(); o.maxSize = 1920; o.videoBitRate = 8_000_000
         case "data":
             o = .remote(); o.maxSize = 1280; o.videoBitRate = 3_000_000; o.maxFps = 45
-        default: // auto: pick by path
-            let slow = t.kind == .tailscale || t.kind == .remote || (t.rttMs ?? 0) > 60
+        default: // auto: pick by measured latency (Tailscale is often a direct LAN path)
             if t.kind == .usb { o = StreamOptions(); o.maxSize = 0; o.videoBitRate = 20_000_000 }
-            else if slow { o = .remote() }
-            else { o = StreamOptions(); o.maxSize = 0; o.videoBitRate = 12_000_000 }
+            else if isSlow(t) { o = .remote() }
+            else { o = StreamOptions(); o.maxSize = 0; o.videoBitRate = 16_000_000 }
         }
         o.videoCodec = MirrorSettings.codec
-        if q != "data" { o.maxFps = MirrorSettings.maxFps }
+        if q != "data" {
+            let fps = MirrorSettings.maxFps
+            // Native rate (0 = no cap). A 60 cap on a 120 Hz phone makes MediaCodec drop frames
+            // unevenly (16/25/33 ms gaps); uncapped, the phone's own cadence is perfectly even.
+            o.maxFps = fps > 0 ? fps : (isSlow(t) ? 60 : 0)
+        }
+        // Every address this phone is known at (its other transports and learned endpoints):
+        // the direct media connection races them and keeps the first that answers.
+        o.directHosts = directHosts(for: t)
+        // Over USB, adb's own transport is the fast path (no Wi-Fi in the loop): never race the
+        // phone's network addresses there.
+        if t.kind == .usb { o.transport = MirrorSettings.usbTransport == "direct" ? .auto : .adb; if o.transport == .adb { o.directHosts = [] } }
+        // Qualcomm encoders have a low-latency mode (~8 ms less touch-to-photon in our tests).
+        if devices.isQualcomm(t.serial) { o.videoCodecOptions += ",vendor.qti-ext-enc-low-latency.enable:int=1" }
         o.audio = MirrorSettings.audio
         o.clipboardAutosync = MirrorSettings.clipboardSync
         o.stayAwake = MirrorSettings.stayAwake
         o.showTouches = MirrorSettings.showTouches
+        // Development: mirror a virtual display instead of the phone's screen (performance tests).
+        if let vd = UserDefaults.standard.string(forKey: "debugVirtualDisplay"), !vd.isEmpty { o.newDisplay = vd }
         return o
+    }
+
+    private func directHosts(for t: Transport) -> [String] {
+        func host(_ ep: String) -> String? {
+            guard let c = ep.lastIndex(of: ":"), !ep.contains("._adb") else { return nil }
+            let h = String(ep[..<c]); return h.isEmpty ? nil : h
+        }
+        var hosts: [String] = []
+        let d = device
+        for tr in d?.transports ?? [] { if let h = host(tr.serial), !hosts.contains(h) { hosts.append(h) } }
+        if let id = d?.id, let k = devices.known.first(where: { $0.id == id }) {
+            for ep in k.endpoints { if let h = host(ep), !hosts.contains(h) { hosts.append(h) } }
+        }
+        return hosts
+    }
+
+    private func isSlow(_ t: Transport) -> Bool {
+        if t.kind == .remote { return true }
+        if let rtt = t.rttMs { return rtt > 45 }
+        return t.kind == .tailscale
     }
 
     private func startSession(on d: PhoneDevice, reason: String?, excluding: Set<String> = []) {
@@ -203,10 +227,20 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
             old?.stop()
             guard let self else { return }
             let s = ScrcpySession(adb: self.adb, serial: t.serial, options: opts)
-            s.onFrame = { [weak self] pb in
+            var firstFrame = true
+            s.onFrame = { [weak self] f in
                 guard let self else { return }
-                self.frames.update(pb)
-                self.displaySink?(pb)
+                self.frames.update(f.buffer)
+                self.displaySink?(f)
+                if firstFrame {
+                    firstFrame = false
+                    // Only a decoded frame proves the path works: reset the backoff here.
+                    DispatchQueue.main.async {
+                        guard gen == self.generation else { return }
+                        self.reconnectAttempt = 0
+                        self.startFailures[t.serial] = nil
+                    }
+                }
             }
             s.onFrameSize = { [weak self] w, h in
                 DispatchQueue.main.async { self?.frameSize = CGSize(width: w, height: h) }
@@ -223,6 +257,7 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
                     if gen == self.generation { self.startInFlight = false }
                     guard gen == self.generation else { s.stop(); return }
                     Log.error("session start failed on \(t.serial): \(error)")
+                    self.startFailures[t.serial] = Date()
                     self.devices.reportFailure(serial: t.serial)
                     self.scheduleReconnect(after: "\(error)", failedSerial: t.serial)
                 }
@@ -231,10 +266,15 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
             DispatchQueue.main.async {
                 if gen == self.generation { self.startInFlight = false }
                 guard gen == self.generation else { s.stop(); return }
+                // The stream may already have died between start() returning and now.
+                guard !s.isStopped else {
+                    self.startFailures[t.serial] = Date()
+                    self.scheduleReconnect(after: "stream closed during startup", failedSerial: t.serial)
+                    return
+                }
                 self.session = s
                 self.activeTransport = t
                 self.state = .streaming
-                self.reconnectAttempt = 0
                 self.consecutivePingFailures = 0
                 self.betterPathSince = nil
                 self.devices.markConnected(d.id)
@@ -259,12 +299,12 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
         reconnectAttempt += 1
         let delay = min(0.25 * pow(2, Double(reconnectAttempt - 1)), 3)
         state = .reconnecting(reconnectAttempt > 2 ? "Reconnecting… (\(shortReason(reason)))" : "Reconnecting…")
-        reconnectScheduled = true
         let gen = generation
+        reconnectGeneration = gen
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            self.reconnectScheduled = false
             guard gen == self.generation, self.wantedDeviceId == id else { return }
+            self.reconnectGeneration = nil
             guard let d = self.devices.device(id: id), d.isOnline else {
                 self.waitingForDevice = true
                 self.state = .reconnecting("Waiting for \(self.device?.name ?? "phone")…")
@@ -312,13 +352,18 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
     /// If a strictly better path (e.g. back on home Wi-Fi, or USB plugged in) has been healthy
     /// for a few seconds, move the stream to it.
     private func considerUpgrade(_ d: PhoneDevice) {
-        guard MirrorSettings.autoSwitchPaths, let active = activeTransport, let best = d.bestTransport,
-              best.serial != active.serial, best.kind < active.kind, best.rttMs != nil else {
+        // A path that recently failed to carry a stream is on cooldown, so we don't flap between paths.
+        let eligible = d.transports.filter { t in
+            t.isHealthy && t.rttMs != nil && (startFailures[t.serial].map { Date().timeIntervalSince($0) > 120 } ?? true)
+        }.sorted { $0.kind != $1.kind ? $0.kind < $1.kind : ($0.rttMs ?? 999) < ($1.rttMs ?? 999) }
+        guard MirrorSettings.autoSwitchPaths, let active = activeTransport, let best = eligible.first,
+              best.serial != active.serial, best.kind < active.kind else {
             betterPathSince = nil
             return
         }
         if let since = betterPathSince {
-            if Date().timeIntervalSince(since) > 4 {
+            // A cable is unambiguous: switch to USB after 1 s; network paths must prove stable for 4 s.
+            if Date().timeIntervalSince(since) > (best.kind == .usb ? 1 : 4) {
                 betterPathSince = nil
                 startSession(on: d, reason: "Faster connection available")
             }
@@ -379,6 +424,8 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
         DispatchQueue.main.async { [self] in
             guard let s = session else { completion(nil); return }
             var done = false
+            clipboardRequestId += 1
+            let requestId = clipboardRequestId
             pendingClipboardReply = { text in
                 guard !done else { return }
                 done = true
@@ -388,145 +435,10 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
                 guard !done else { return }
                 done = true
-                self.pendingClipboardReply = nil
+                if self.clipboardRequestId == requestId { self.pendingClipboardReply = nil }
                 completion(nil)
             }
         }
     }
 
-    // MARK: Input (device pixel coordinates)
-
-    public var screenSize: (UInt16, UInt16) { session?.frameSize ?? (0, 0) }
-
-    public func send(_ bytes: [UInt8]) { session?.send(bytes) }
-
-    public func touch(_ action: MotionAction, x: Double, y: Double, pointer: UInt64 = PointerID.genericFinger, pressure: Float = 1) {
-        guard let s = session else { return }
-        let (w, h) = s.frameSize
-        guard w > 0 else { return }
-        let px = max(0, min(Double(w) - 1, x)), py = max(0, min(Double(h) - 1, y))
-        s.send(ControlMessage.touch(action, pointer: pointer, at: DevicePoint(px, py), screen: (w, h), pressure: pressure))
-    }
-
-    public func scroll(x: Double, y: Double, dx: Float, dy: Float) {
-        guard let s = session else { return }
-        let (w, h) = s.frameSize
-        guard w > 0 else { return }
-        s.send(ControlMessage.scroll(at: DevicePoint(x, y), screen: (w, h), h: dx, v: dy))
-    }
-
-    public func key(_ code: Int32, meta: Int32 = 0, longPress: Bool = false) {
-        guard let s = session else { return }
-        s.send(ControlMessage.keycode(.down, code, meta: meta))
-        if longPress {
-            for i in 1...12 { preciseSleep(microseconds: 50_000); s.send(ControlMessage.keycode(.down, code, repeatCount: Int32(i), meta: meta)) }
-        }
-        s.send(ControlMessage.keycode(.up, code, meta: meta))
-    }
-
-    public func keyEvent(_ action: KeyAction, _ code: Int32, meta: Int32 = 0, repeatCount: Int32 = 0) {
-        session?.send(ControlMessage.keycode(action, code, repeatCount: repeatCount, meta: meta))
-    }
-
-    /// Type text. ASCII goes through key injection; anything else via clipboard paste,
-    /// which works in every text field regardless of keyboard app.
-    public func type(_ text: String) {
-        guard let s = session, !text.isEmpty else { return }
-        let ascii = text.unicodeScalars.allSatisfy { $0.isASCII && ($0.value >= 0x20 || $0 == "\n" || $0 == "\t") }
-        if ascii {
-            var chunk = ""
-            for ch in text {
-                if ch == "\n" {
-                    if !chunk.isEmpty { s.send(ControlMessage.text(chunk)); chunk = "" }
-                    key(AKey.enter)
-                    continue
-                }
-                chunk.append(ch)
-                if chunk.utf8.count >= 250 { s.send(ControlMessage.text(chunk)); chunk = "" }
-            }
-            if !chunk.isEmpty { s.send(ControlMessage.text(chunk)) }
-        } else {
-            setDeviceClipboard(text, paste: true)
-        }
-    }
-
-    public func backOrScreenOn() {
-        session?.send(ControlMessage.backOrScreenOn(.down))
-        session?.send(ControlMessage.backOrScreenOn(.up))
-    }
-
-    public func setDisplayPower(_ on: Bool) { session?.send(ControlMessage.setDisplayPower(on)) }
-    public func rotate() { session?.send(ControlMessage.rotateDevice()) }
-    public func expandNotifications() { session?.send(ControlMessage.expandNotifications()) }
-    public func expandSettings() { session?.send(ControlMessage.expandSettings()) }
-    public func collapsePanels() { session?.send(ControlMessage.collapsePanels()) }
-    public func startApp(_ name: String) { session?.send(ControlMessage.startApp(name)) }
-    public func requestKeyFrame() { session?.send(ControlMessage.resetVideo()) }
-    public var audioVolume: Float {
-        get { session?.audioVolume ?? 1 }
-        set { session?.audioVolume = newValue }
-    }
-
-    // MARK: Gestures (blocking; call off the main thread)
-
-    public func tap(x: Double, y: Double) {
-        touch(.down, x: x, y: y)
-        preciseSleep(microseconds: 40_000)
-        touch(.up, x: x, y: y)
-    }
-
-    public func longPress(x: Double, y: Double, ms: Int) {
-        touch(.down, x: x, y: y)
-        var waited = 0
-        while waited < ms { preciseSleep(microseconds: 100_000); waited += 100; touch(.move, x: x, y: y) }
-        touch(.up, x: x, y: y)
-    }
-
-    public func swipe(x1: Double, y1: Double, x2: Double, y2: Double, ms: Int) {
-        let steps = max(4, ms / 8)
-        touch(.down, x: x1, y: y1)
-        for i in 1...steps {
-            let t = Double(i) / Double(steps)
-            // ease-in-out so the end velocity is realistic (prevents unintended flings)
-            let e = t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2
-            touch(.move, x: x1 + (x2 - x1) * e, y: y1 + (y2 - y1) * e)
-            preciseSleep(microseconds: max(1, ms * 1000 / steps))
-        }
-        touch(.up, x: x2, y: y2)
-    }
-
-    public func pinch(cx: Double, cy: Double, scale: Double, ms: Int = 400) {
-        let (w, h) = screenSize
-        let base = Double(min(w, h)) * 0.12
-        let startR = scale >= 1 ? base : base * 2.5
-        let endR = max(20, min(Double(min(w, h)) * 0.45, startR * scale))
-        let steps = max(6, ms / 10)
-        let p0: UInt64 = 10, p1: UInt64 = 11
-        touch(.down, x: cx - startR, y: cy, pointer: p0)
-        touch(.pointerDown, x: cx + startR, y: cy, pointer: p1)
-        for i in 1...steps {
-            let r = startR + (endR - startR) * Double(i) / Double(steps)
-            touch(.move, x: cx - r, y: cy, pointer: p0)
-            touch(.move, x: cx + r, y: cy, pointer: p1)
-            preciseSleep(microseconds: ms * 1000 / steps)
-        }
-        touch(.pointerUp, x: cx + endR, y: cy, pointer: p1)
-        touch(.up, x: cx - endR, y: cy, pointer: p0)
-    }
-
-    /// Wake and unlock with a PIN (digits typed on the keyguard).
-    public func unlock(pin: String?) {
-        guard let s = session else { return }
-        let q = DeviceQueries(adb: adb, serial: s.serial)
-        if !q.isScreenOn() { key(AKey.wakeup); preciseSleep(microseconds: 400_000) }
-        guard q.isLocked() else { return }
-        let (w, h) = screenSize
-        swipe(x1: Double(w) / 2, y1: Double(h) * 0.85, x2: Double(w) / 2, y2: Double(h) * 0.3, ms: 250)
-        preciseSleep(microseconds: 500_000)
-        if let pin, !pin.isEmpty {
-            s.send(ControlMessage.text(pin))
-            preciseSleep(microseconds: 150_000)
-            key(AKey.enter)
-        }
-    }
 }

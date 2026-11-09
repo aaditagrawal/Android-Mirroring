@@ -8,13 +8,18 @@ import MirrorKit
 final class MirrorView: NSView, NSTextInputClient {
     let controller: MirrorController
     private let displayLayer = AVSampleBufferDisplayLayer()
+    /// Metal presenter with display-linked frame pacing (falls back to the sample-buffer layer).
+    let renderer = VideoRenderer()
     private var formatDesc: CMVideoFormatDescription?
     private var formatDims: (Int32, Int32) = (0, 0)
     private var trackingArea: NSTrackingArea?
+    private var defaultsObserver: NSObjectProtocol?
+    private var windowObservers: [NSObjectProtocol] = []
 
     // Touch state
     private var mouseDown = false
-    private var scrollFingerActive = false
+    private var scrollFingerActive = false   // a finger is down on the phone
+    private var scrollGestureLive = false    // trackpad gesture in progress (finger may not be down yet)
     private var scrollFingerPos = CGPoint.zero
     private var scrollEndWork: DispatchWorkItem?
     private var pinchActive = false
@@ -33,16 +38,28 @@ final class MirrorView: NSView, NSTextInputClient {
         wantsLayer = true
         layer = CALayer()
         layer?.backgroundColor = NSColor.black.cgColor
-        displayLayer.videoGravity = .resizeAspect
-        displayLayer.backgroundColor = NSColor.black.cgColor
-        displayLayer.frame = bounds
-        displayLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        // Never wait for a timebase: show each frame the moment it is decoded.
-        displayLayer.preventsDisplaySleepDuringVideoPlayback = true
-        layer?.addSublayer(displayLayer)
+        if let renderer {
+            renderer.layer.frame = bounds
+            renderer.layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+            layer?.addSublayer(renderer.layer)
+            renderer.pacing = MirrorSettings.pacing
+            // Follow the setting wherever it is changed from (Settings, the agent API, `defaults write`).
+            defaultsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak renderer] _ in
+                let p = MirrorSettings.pacing
+                if renderer?.pacing != p { renderer?.pacing = p }
+            }
+            controller.displaySink = { [weak renderer] f in renderer?.push(f) }
+        } else {
+            displayLayer.videoGravity = .resizeAspect
+            displayLayer.backgroundColor = NSColor.black.cgColor
+            displayLayer.frame = bounds
+            displayLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+            // Never wait for a timebase: show each frame the moment it is decoded.
+            displayLayer.preventsDisplaySleepDuringVideoPlayback = true
+            layer?.addSublayer(displayLayer)
+            controller.displaySink = { [weak self] f in self?.enqueue(f.buffer) }
+        }
         registerForDraggedTypes([.fileURL])
-
-        controller.displaySink = { [weak self] pb in self?.enqueue(pb) }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -57,7 +74,53 @@ final class MirrorView: NSView, NSTextInputClient {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         displayLayer.frame = bounds
+        if let r = renderer {
+            r.layer.frame = bounds
+            let scale = window?.backingScaleFactor ?? 2
+            r.layer.contentsScale = scale
+            r.layer.drawableSize = CGSize(width: max(1, bounds.width * scale), height: max(1, bounds.height * scale))
+            r.setNeedsRedraw()
+        }
         CATransaction.commit()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsLayout = true
+    }
+
+    deinit {
+        if let o = defaultsObserver { NotificationCenter.default.removeObserver(o) }
+        windowObservers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        windowObservers.forEach(NotificationCenter.default.removeObserver)
+        windowObservers = []
+        guard let w = window else { renderer?.paused = true; return }
+        let nc = NotificationCenter.default
+        windowObservers = [
+            nc.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: w, queue: .main) { [weak self] _ in self?.updatePaused() },
+            nc.addObserver(forName: NSWindow.didChangeScreenNotification, object: w, queue: .main) { [weak self] _ in self?.updateFrameRate() },
+        ]
+        updatePaused()
+        updateFrameRate()
+    }
+
+    /// Match the refresh rate of the screen the window is on (e.g. 120 Hz on a ProMotion panel).
+    private func updateFrameRate() {
+        guard let hz = window?.screen?.maximumFramesPerSecond else { return }
+        renderer?.setMaxFrameRate(hz)
+    }
+
+    /// Stop the display link while the window can't be seen (saves power; the agent API reads the
+    /// frame store, not the screen).
+    private func updatePaused() {
+        guard let r = renderer else { return }
+        let visible = window?.occlusionState.contains(.visible) ?? false
+        r.paused = !visible
+        if visible { r.setNeedsRedraw() }
     }
 
     override func updateTrackingAreas() {
@@ -95,6 +158,7 @@ final class MirrorView: NSView, NSTextInputClient {
     }
 
     func clearDisplay() {
+        renderer?.clear()
         displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true)
     }
 
@@ -190,13 +254,16 @@ final class MirrorView: NSView, NSTextInputClient {
         let k = pointsToPixels
         switch e.phase {
         case .began, .mayBegin:
+            // Only remember where the gesture starts. Putting the finger down here would turn a
+            // resting two-finger touch (mayBegin → cancelled) into a tap on the phone.
             if scrollFingerActive { endScrollFinger() }
             scrollFingerPos = devicePoint(location(e))
-            scrollFingerActive = true
-            controller.touch(.down, x: scrollFingerPos.x, y: scrollFingerPos.y, pointer: MirrorView.scrollPointer)
+            scrollGestureLive = true
         case .changed:
+            if e.scrollingDeltaX == 0 && e.scrollingDeltaY == 0 { break }
             if !scrollFingerActive {
-                scrollFingerPos = devicePoint(location(e))
+                if !scrollGestureLive { scrollFingerPos = devicePoint(location(e)) }
+                scrollGestureLive = true
                 scrollFingerActive = true
                 controller.touch(.down, x: scrollFingerPos.x, y: scrollFingerPos.y, pointer: MirrorView.scrollPointer)
             }
@@ -205,6 +272,7 @@ final class MirrorView: NSView, NSTextInputClient {
             scrollFingerPos.y = max(1, min(fs.height - 2, scrollFingerPos.y + e.scrollingDeltaY * k))
             controller.touch(.move, x: scrollFingerPos.x, y: scrollFingerPos.y, pointer: MirrorView.scrollPointer)
         case .ended, .cancelled:
+            scrollGestureLive = false
             endScrollFinger()
         default:
             break
@@ -233,7 +301,7 @@ final class MirrorView: NSView, NSTextInputClient {
             pinchActive = true
             pinchCenter = devicePoint(location(e))
             pinchRadius = min(fs.width, fs.height) * 0.1
-            sendPinch(.down, .pointerDown)
+            sendPinch(.down, .down)
         case .changed:
             guard pinchActive else { return }
             pinchRadius = max(10, min(min(fs.width, fs.height) * 0.48, pinchRadius * (1 + e.magnification)))
@@ -241,7 +309,8 @@ final class MirrorView: NSView, NSTextInputClient {
         case .ended, .cancelled:
             guard pinchActive else { return }
             pinchActive = false
-            sendPinch(.pointerUp, .up, reversed: true)
+            // The server derives ACTION_POINTER_DOWN/UP itself; send plain DOWN/UP per finger.
+            sendPinch(.up, .up, reversed: true)
         default: break
         }
     }

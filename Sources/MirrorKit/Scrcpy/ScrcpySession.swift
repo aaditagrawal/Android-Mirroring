@@ -15,6 +15,22 @@ public struct StreamOptions: Equatable, Sendable {
     public var powerOffOnClose: Bool = false
     public var displayId: Int = 0
     public var turnScreenOff: Bool = false
+    /// MediaCodec options, scrcpy syntax: "key:type=value,key2:type=value".
+    public var videoCodecOptions: String = "priority:int=0"
+    /// Mirror a new virtual display instead ("" = main display size, or "WxH/dpi").
+    public var newDisplay: String?
+    /// Extra raw server arguments (key=value), for experiments.
+    public var extraServerArgs: [String] = []
+    /// How media/control bytes travel. `.direct` runs a tiny relay on the phone and connects to
+    /// it over plain TCP (LAN or Tailscale), bypassing adb's multiplexed, flow-controlled transport.
+    public var transport: MediaTransport = .auto
+    /// Addresses the phone may be reachable at for `.direct` (LAN, Tailscale, ...). All are tried
+    /// at once; the first to answer wins. The host part of a TCP serial is always included.
+    public var directHosts: [String] = []
+    /// Relay socket send buffer on the phone (0 = system default). Small = less queueing.
+    public var relaySendBuffer: Int = 0
+    /// Direct transport: timestamp control messages so the relay can replay them evenly.
+    public var timedControl: Bool = true
 
     public init() {}
 
@@ -26,6 +42,22 @@ public struct StreamOptions: Equatable, Sendable {
         o.audioBitRate = 96_000
         return o
     }
+}
+
+public enum MediaTransport: String, Sendable {
+    case auto      // direct when the phone's address is reachable, else adb
+    case direct
+    case adb
+}
+
+/// Per-packet timing, for performance analysis (times are DispatchTime uptime nanoseconds).
+public struct PacketTrace: Sendable {
+    public var pts: Int64          // device capture timestamp, µs (relative to stream start)
+    public var size: Int
+    public var key: Bool
+    public var tHeader: UInt64     // header fully received
+    public var tPayload: UInt64    // payload fully received
+    public var tDecoded: UInt64    // decoder returned
 }
 
 public struct StreamStats: Sendable {
@@ -55,6 +87,23 @@ public final class ScrcpySession: @unchecked Sendable {
     let adb: ADBClient
     let scid: UInt32 = UInt32.random(in: 1..<0x7FFF_FFFF)
 
+    /// The transport actually in use for this session.
+    public private(set) var activeTransport: MediaTransport = .adb
+    private var relayPort: UInt16 = 0
+    private var relayToken: [UInt8] = []
+    private var candidateHosts: [String] {
+        var hosts: [String] = []
+        // TCP serials ("host:port"); mDNS / USB serials have no directly usable host.
+        if let colon = serial.lastIndex(of: ":"), !serial.contains("._adb") {
+            let h = String(serial[..<colon])
+            if !h.isEmpty { hosts.append(h) }
+        }
+        for h in options.directHosts where !hosts.contains(h) { hosts.append(h) }
+        return hosts
+    }
+    /// The host that answered (direct transport).
+    public private(set) var directHost: String?
+
     private var serverStream: TCPSocket?
     private var videoSocket: TCPSocket?
     private var audioSocket: TCPSocket?
@@ -71,17 +120,26 @@ public final class ScrcpySession: @unchecked Sendable {
     public private(set) var frameSize: (UInt16, UInt16) = (0, 0)
 
     // Callbacks (invoked on the stream threads).
-    public var onFrame: ((CVPixelBuffer) -> Void)?
+    /// Each decoded frame with its capture and decode times.
+    public var onFrame: ((DecodedFrame) -> Void)?
     public var onFrameSize: ((Int, Int) -> Void)?
     public var onClipboard: ((String) -> Void)?
     public var onClosed: ((String?) -> Void)?
     public var onStats: ((StreamStats) -> Void)?
+    public var onPacketTrace: ((PacketTrace) -> Void)?
+    public var onServerLog: ((String) -> Void)?
     public var audioVolume: Float = 1 { didSet { audioPlayer?.volume = audioVolume } }
 
     private var statFrames = 0
     private var statBytes = 0
     private var statStart = DispatchTime.now()
     private var stats = StreamStats()
+
+    /// Distinguishes this session's frames (and pts clock) from earlier sessions'.
+    public let streamID: UInt32 = ScrcpySession.nextStreamID()
+    private static let idLock = NSLock()
+    nonisolated(unsafe) private static var lastStreamID: UInt32 = 0
+    private static func nextStreamID() -> UInt32 { idLock.lock(); defer { idLock.unlock() }; lastStreamID &+= 1; return lastStreamID }
 
     public init(adb: ADBClient, serial: String, options: StreamOptions) {
         self.adb = adb
@@ -94,11 +152,17 @@ public final class ScrcpySession: @unchecked Sendable {
     /// Blocking: pushes the server, launches it and connects all sockets. Then spawns reader threads.
     public func start() throws {
         let t0 = DispatchTime.now()
-        try pushServerIfNeeded()
-        try launchServer()
-        try connectSockets()
+        do {
+            try pushServerIfNeeded()
+            try launchServer()
+            try connectSockets()
+        } catch {
+            // Release the server stream (ends the log thread and the device process) and any sockets.
+            stop()
+            throw error
+        }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6
-        Log.info("scrcpy session \(String(format: "%08x", scid)) up on \(serial) in \(Int(ms)) ms")
+        Log.info("scrcpy session \(String(format: "%08x", scid)) up on \(serial) in \(Int(ms)) ms via \(activeTransport == .direct ? "direct TCP \(directHost ?? ""):\(relayPort)" : "adb")")
         startReaders()
     }
 
@@ -120,6 +184,22 @@ public final class ScrcpySession: @unchecked Sendable {
         guard let url = ScrcpySession.serverJarURL() else { throw ADBError("scrcpy-server resource missing from app bundle") }
         let data = try Data(contentsOf: url)
         try ScrcpySession.ensureServer(adb: adb, serial: serial, data: data)
+    }
+
+    static let relayJar = "/data/local/tmp/android-mirroring-relay-3.jar"
+
+    static func relayJarURL() -> URL? {
+        if let u = Bundle.main.url(forResource: "relay", withExtension: "jar") { return u }
+        return serverJarURL().map { $0.deletingLastPathComponent().appendingPathComponent("relay.jar") }
+            .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+    }
+
+    static func ensureRelay(adb: ADBClient, serial: String) throws -> Bool {
+        guard let url = relayJarURL(), let data = try? Data(contentsOf: url) else { return false }
+        let remoteSize = try adb.shell(serial: serial, "stat -c %s \(relayJar) 2>/dev/null", timeout: 5)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if remoteSize != String(data.count) { try adb.push(serial: serial, data: data, remotePath: relayJar) }
+        return true
     }
 
     static func ensureServer(adb: ADBClient, serial: String, data: Data? = nil) throws {
@@ -164,9 +244,10 @@ public final class ScrcpySession: @unchecked Sendable {
             "power_off_on_close=\(o.powerOffOnClose)",
             "downsize_on_error=true",
             "cleanup=true",
-            // Ask MediaCodec for realtime priority (0) so the encoder is scheduled ahead of background work.
-            "video_codec_options=priority:int=0",
         ]
+        if !o.videoCodecOptions.isEmpty { a.append("video_codec_options=\(o.videoCodecOptions)") }
+        if let nd = o.newDisplay { a.append(nd.isEmpty ? "new_display" : "new_display=\(nd)") }
+        a += o.extraServerArgs
         if o.maxSize > 0 { a.append("max_size=\(o.maxSize)") }
         if o.audio {
             a.append("audio_codec=\(o.audioCodec)")
@@ -177,7 +258,14 @@ public final class ScrcpySession: @unchecked Sendable {
     }
 
     private func launchServer() throws {
-        let cmd = ScrcpySession.launchPrefix(String(format: "%08x", scid)) + " " + serverArgs().joined(separator: " ")
+        var cmd = ScrcpySession.launchPrefix(String(format: "%08x", scid)) + " " + serverArgs().joined(separator: " ")
+        if options.transport != .adb, !candidateHosts.isEmpty, (try? ScrcpySession.ensureRelay(adb: adb, serial: serial)) == true {
+            relayPort = UInt16.random(in: 27200...28999)
+            relayToken = (0..<16).map { _ in UInt8.random(in: 0...255) }
+            let hex = relayToken.map { String(format: "%02x", $0) }.joined()
+            let relay = "CLASSPATH=\(ScrcpySession.relayJar) app_process / Relay \(relayPort) \(hex) scrcpy_\(String(format: "%08x", scid)) \(options.relaySendBuffer)"
+            cmd = relay + " & " + cmd
+        }
         let s = try adb.openStream(serial: serial, service: "exec:\(cmd)", timeout: 8)
         serverStream = s
         let name = String(format: "%08x", scid)
@@ -189,7 +277,7 @@ public final class ScrcpySession: @unchecked Sendable {
                 while let nl = pending.firstIndex(of: "\n") {
                     let line = String(pending[..<nl]).trimmingCharacters(in: .whitespaces)
                     pending = String(pending[pending.index(after: nl)...])
-                    if !line.isEmpty { Log.info("[server \(name)] \(line)") }
+                    if !line.isEmpty { Log.info("[server \(name)] \(line)"); self?.onServerLog?(line) }
                 }
             }
             if let self, !self.isStopped { Log.warn("[server \(name)] process output closed") }
@@ -200,7 +288,51 @@ public final class ScrcpySession: @unchecked Sendable {
         try adb.openStream(serial: serial, service: "localabstract:scrcpy_\(String(format: "%08x", scid))", timeout: 5)
     }
 
+    /// Direct TCP connection through the relay: connect, authenticate with the token.
+    private func openDirect(timeout: TimeInterval, timed: Bool = false) throws -> TCPSocket {
+        let s: TCPSocket
+        if let host = directHost {
+            s = try TCPSocket.connect(host: host, port: relayPort, timeout: timeout)
+        } else {
+            let (sock, host) = try TCPSocket.connectFirst(hosts: candidateHosts, port: relayPort, timeout: timeout)
+            s = sock
+            directHost = host
+        }
+        try s.write(relayToken + [timed ? 1 : 0])
+        return s
+    }
+
+    private func openMedia(control: Bool = false) throws -> TCPSocket {
+        activeTransport == .direct ? try openDirect(timeout: 3, timed: control && options.timedControl) : try openLocalAbstract()
+    }
+    private var controlTimed = false
+
     private func connectSockets() throws {
+        // Try the direct path first (the relay JVM needs ~0.3 s to listen); fall back to adb.
+        if relayPort != 0 {
+            let deadline = Date().addingTimeInterval(options.transport == .direct ? 8 : 2.5)
+            var lastErr: Error?
+            while Date() < deadline, !isStopped {
+                do {
+                    let s = try openDirect(timeout: 1)
+                    s.setReadTimeout(10)
+                    let b = try s.readBytes(1)   // relay waits for the server, then forwards its dummy byte
+                    if b.count == 1 {
+                        activeTransport = .direct
+                        try finishConnect(video: s)
+                        return
+                    }
+                } catch {
+                    lastErr = error
+                    directHost = nil
+                    // "Refused" = the phone answered but the relay isn't listening yet: retry.
+                    if "\(error)".contains("refused") { usleep(40_000) } else if options.transport != .direct { break }
+                }
+            }
+            if options.transport == .direct { throw ADBError("direct connection failed: \(lastErr.map { "\($0)" } ?? "timeout")") }
+            Log.warn("direct path unavailable (\(lastErr.map { "\($0)" } ?? "timeout")), using adb")
+        }
+        activeTransport = .adb
         // The server needs a moment to start its JVM and bind; retry until it answers with the dummy byte.
         let deadline = Date().addingTimeInterval(12)
         var video: TCPSocket?
@@ -217,9 +349,15 @@ public final class ScrcpySession: @unchecked Sendable {
             }
         }
         guard let video else { throw ADBError("scrcpy server did not start: \(lastErr.map { "\($0)" } ?? "timeout")") }
+        try finishConnect(video: video)
+    }
+
+    private func finishConnect(video: TCPSocket) throws {
         videoSocket = video
-        if options.audio { audioSocket = try openLocalAbstract() }
-        controlSocket = try openLocalAbstract()
+        if options.audio { audioSocket = try openMedia() }
+        controlSocket = try openMedia(control: true)
+        controlTimed = activeTransport == .direct && options.timedControl
+        controlSocket?.setWriteTimeout(2)   // never block the UI thread on a stalled link
 
         video.setReadTimeout(8)
         let meta = try video.readBytes(64)
@@ -265,7 +403,7 @@ public final class ScrcpySession: @unchecked Sendable {
             }
             guard let codec = VideoCodecID(rawValue: codecRaw) else { throw ADBError("unsupported video codec 0x\(String(codecRaw, radix: 16))") }
             let dec = VideoDecoder(codec: codec)
-            dec.onFrame = { [weak self] pb, _ in self?.handleFrame(pb) }
+            dec.onFrame = { [weak self] pb, pts in self?.handleFrame(pb, pts: pts) }
             dec.onError = { [weak self] status in self?.handleDecodeError(status) }
             decoder = dec
             stats.codec = codec.name
@@ -276,6 +414,7 @@ public final class ScrcpySession: @unchecked Sendable {
             var header = [UInt8](repeating: 0, count: 12)
             while !isStopped {
                 try header.withUnsafeMutableBytes { try sock.readFully(into: $0.baseAddress!, count: 12) }
+                let tHeader = DispatchTime.now().uptimeNanoseconds
                 let first = header.withUnsafeBytes { be64($0.baseAddress!) }
                 if header[0] & 0x80 != 0 {
                     let w = header.withUnsafeBytes { be32($0.baseAddress!, 4) }
@@ -298,6 +437,11 @@ public final class ScrcpySession: @unchecked Sendable {
                 let pts = Int64(bitPattern: first & ((1 << 61) - 1))
                 if isConfig {
                     dec.configure(annexB: Data(bytes: buf, count: size))
+                } else if let trace = onPacketTrace {
+                    let tPayload = DispatchTime.now().uptimeNanoseconds
+                    dec.decode(annexB: buf, count: size, pts: pts)
+                    trace(PacketTrace(pts: pts, size: size, key: first & (1 << 61) != 0, tHeader: tHeader,
+                                      tPayload: tPayload, tDecoded: DispatchTime.now().uptimeNanoseconds))
                 } else {
                     dec.decode(annexB: buf, count: size, pts: pts)
                 }
@@ -319,9 +463,9 @@ public final class ScrcpySession: @unchecked Sendable {
         }
     }
 
-    private func handleFrame(_ pb: CVPixelBuffer) {
+    private func handleFrame(_ pb: CVPixelBuffer, pts: Int64) {
         statFrames += 1
-        onFrame?(pb)
+        onFrame?(DecodedFrame(buffer: pb, pts: pts, arrival: DispatchTime.now().uptimeNanoseconds, stream: streamID))
         let now = DispatchTime.now()
         let dt = Double(now.uptimeNanoseconds - statStart.uptimeNanoseconds) / 1e9
         if dt >= 1 {
@@ -405,7 +549,18 @@ public final class ScrcpySession: @unchecked Sendable {
         guard let s = controlSocket, !isStopped else { return }
         controlLock.lock()
         defer { controlLock.unlock() }
-        do { try s.write(bytes) } catch { Log.warn("control write failed: \(error)") }
+        do {
+            if controlTimed {
+                var framed: [UInt8] = []
+                framed.reserveCapacity(bytes.count + 10)
+                framed.appendBE(UInt16(bytes.count))
+                framed.appendBE(UInt64(DispatchTime.now().uptimeNanoseconds / 1000))
+                framed += bytes
+                try s.write(framed)
+            } else {
+                try s.write(bytes)
+            }
+        } catch { Log.warn("control write failed: \(error)") }
     }
 
     private func be32Read(_ b: [UInt8]) -> UInt32 {

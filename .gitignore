@@ -1,5 +1,26 @@
+# SwiftPM and local builds
 .build/
+.swiftpm/
 build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Android relay intermediates (the runtime JAR in Resources is intentional)
+android/relay/out/
+local.properties
+
+# Local credentials and experiment output
+.env
+.env.*
+!.env.example
+*.log
+*.jsonl
+*.sock
+*.jks
+*.keystore
+*.p12
+*.mobileprovision
+
+# macOS
 .DS_Store
-*.png
-!docs/*.png

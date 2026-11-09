@@ -14,178 +14,6 @@ setvbuf(stdout, nil, _IOLBF, 0)
 
 func eprint(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
-/// Connect to the app, launching it in the background if needed.
-func connectClient() throws -> AgentClient {
-    let c = AgentClient()
-    do {
-        try c.connect()
-        return c
-    } catch AgentError.notRunning {
-        launchApp()
-        let deadline = Date().addingTimeInterval(15)
-        while Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.25)
-            if (try? c.connect()) != nil { return c }
-        }
-        throw AgentError.message("Android Mirroring did not start (is it installed in /Applications?)")
-    }
-}
-
-func launchApp() {
-    // Prefer the app bundle that contains this binary, then the installed app.
-    var candidates: [String] = []
-    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-    let bundle = exe.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    if bundle.pathExtension == "app" { candidates.append(bundle.path) }
-    candidates += ["/Applications/Android Mirroring.app", NSHomeDirectory() + "/Applications/Android Mirroring.app"]
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    if let path = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
-        p.arguments = ["-g", path]
-    } else {
-        p.arguments = ["-g", "-b", AgentAPI.bundleIdentifier]
-    }
-    try? p.run()
-    p.waitUntilExit()
-}
-
-func jsonString(_ obj: Any) -> String {
-    guard JSONSerialization.isValidJSONObject(obj),
-          let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else { return "\(obj)" }
-    return String(decoding: d, as: UTF8.self)
-}
-
-// MARK: - MCP server
-
-final class MCPServer {
-    var client: AgentClient?
-
-    func run() {
-        while let line = readLine(strippingNewline: true) {
-            guard !line.isEmpty, let data = line.data(using: .utf8),
-                  let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-            let id = msg["id"]
-            let method = msg["method"] as? String ?? ""
-            let params = msg["params"] as? [String: Any] ?? [:]
-            if id == nil { continue } // notification (e.g. notifications/initialized)
-            let response: [String: Any]
-            switch method {
-            case "initialize":
-                let requested = params["protocolVersion"] as? String ?? "2025-06-18"
-                response = result(id, [
-                    "protocolVersion": requested,
-                    "capabilities": ["tools": ["listChanged": false]],
-                    "serverInfo": ["name": "android-mirroring", "version": "1.0.0"],
-                    "instructions": """
-                    Controls the user's Android phone through Android Mirroring (live, low-latency).
-                    Typical loop: screenshot → decide → tap/swipe/type_text/press_key → screenshot.
-                    Coordinates are pixels in the most recent screenshot. ui_tree gives exact element bounds and \
-                    tap_element taps by visible text. launch_app opens apps by name. The phone does not need to be \
-                    locked or idle; the user may be watching the mirror window.
-                    """,
-                ])
-            case "ping":
-                response = result(id, [:])
-            case "tools/list":
-                let tools = AgentTools.all.map { ["name": $0.name, "description": $0.description, "inputSchema": $0.schema] as [String: Any] }
-                response = result(id, ["tools": tools])
-            case "tools/call":
-                response = result(id, callTool(params["name"] as? String ?? "", params["arguments"] as? [String: Any] ?? [:]))
-            default:
-                response = ["jsonrpc": "2.0", "id": id!, "error": ["code": -32601, "message": "method not found: \(method)"]]
-            }
-            send(response)
-        }
-    }
-
-    private func result(_ id: Any?, _ r: [String: Any]) -> [String: Any] { ["jsonrpc": "2.0", "id": id ?? NSNull(), "result": r] }
-
-    private func send(_ obj: [String: Any]) {
-        guard var d = try? JSONSerialization.data(withJSONObject: obj, options: [.withoutEscapingSlashes]) else { return }
-        d.append(0x0A)
-        FileHandle.standardOutput.write(d)
-    }
-
-    private func callTool(_ name: String, _ args: [String: Any]) -> [String: Any] {
-        guard AgentTools.named(name) != nil else {
-            return ["content": [["type": "text", "text": "Unknown tool \(name)"]], "isError": true]
-        }
-        do {
-            let r = try call(name, args)
-            if name == "screenshot", let img = r["image"] as? String {
-                let w = r["width"] as? Int ?? 0, h = r["height"] as? Int ?? 0
-                return ["content": [
-                    ["type": "image", "data": img, "mimeType": r["mime"] as? String ?? "image/jpeg"],
-                    ["type": "text", "text": "Screenshot \(w)x\(h) px (tap coordinates use this grid)."],
-                ]]
-            }
-            if let out = r["output"] as? String, r.count == 1 {
-                return ["content": [["type": "text", "text": out]]]
-            }
-            if r.count == 1, r["ok"] as? Bool == true {
-                return ["content": [["type": "text", "text": "ok"]]]
-            }
-            return ["content": [["type": "text", "text": jsonString(r)]]]
-        } catch {
-            return ["content": [["type": "text", "text": "Error: \(error)"]], "isError": true]
-        }
-    }
-
-    /// Calls the app, reconnecting once if the app restarted.
-    private func call(_ method: String, _ params: [String: Any]) throws -> [String: Any] {
-        if client == nil { client = try connectClient() }
-        do {
-            return try client!.call(method, params)
-        } catch AgentError.message(let m) where m.contains("connection closed") || m.contains("write failed") {
-            client = try connectClient()
-            return try client!.call(method, params)
-        }
-    }
-}
-
-// MARK: - CLI
-
-func usage() -> Never {
-    print("""
-    droidctl — control the phone mirrored by Android Mirroring
-
-    MCP:
-      droidctl mcp                          Run as an MCP server over stdio
-
-    Commands:
-      status                                Connection status
-      info                                  Device, battery, stream details
-      screenshot [-o FILE] [--max N] [--png]  Save a screenshot (default ./screenshot.jpg)
-      tap X Y                               Tap (screenshot pixel coordinates)
-      double-tap X Y
-      long-press X Y [MS]
-      swipe X1 Y1 X2 Y2 [MS]
-      scroll DY [X Y]                       Mouse-wheel scroll (positive = down)
-      type TEXT...                          Type text (any Unicode)
-      key NAME [--long]                     home back recents enter delete tab volume_up power …
-      ui [FILTER]                           List on-screen elements with bounds
-      tap-text QUERY                        Tap the element matching text / id / description
-      wait-for QUERY [TIMEOUT_MS]           Wait for an element to appear
-      launch APP                            Launch by package or label
-      apps [FILTER]                         List apps
-      open URL                              Open a URL / deep link
-      current                               Foreground app
-      notifications                         Current notifications
-      clipboard [TEXT]                      Read, or set, the phone clipboard
-      unlock                                Wake + unlock with the saved PIN
-      screen on|off                         Phone display power (mirroring continues)
-      shell CMD...                          adb shell
-      install APK                           Install an APK
-      push FILE [REMOTE]                    Copy a file to the phone
-      pull REMOTE [LOCAL]                   Copy a file from the phone
-      show | hide                           Show/hide the mirror window
-      call METHOD [JSON]                    Raw API call
-      tools                                 List API tools (JSON)
-
-    Coordinates refer to the last screenshot (long edge \(AgentAPI.defaultMaxDimension) px by default).
-    """)
-    exit(2)
-}
 
 var args = Array(CommandLine.arguments.dropFirst())
 guard let cmd = args.first else { usage() }
@@ -199,7 +27,7 @@ if cmd == "tools" {
     print(jsonString(AgentTools.all.map { ["name": $0.name, "description": $0.description, "inputSchema": $0.schema] }))
     exit(0)
 }
-if cmd == "-h" || cmd == "--help" || cmd == "help" { usage() }
+if cmd == "-h" || cmd == "--help" || cmd == "help" { usage(exitCode: 0) }
 
 func d(_ s: String) -> Double {
     guard let v = Double(s) else { eprint("not a number: \(s)"); exit(2) }
@@ -222,8 +50,12 @@ do {
         var i = 0
         while i < args.count {
             switch args[i] {
-            case "-o": i += 1; out = args[i]
-            case "--max": i += 1; maxDim = Int(args[i]) ?? maxDim
+            case "-o":
+                guard i + 1 < args.count else { usage() }
+                i += 1; out = args[i]
+            case "--max":
+                guard i + 1 < args.count, let value = Int(args[i + 1]), value >= 0 else { usage() }
+                i += 1; maxDim = value
             case "--png": png = true
             default: out = args[i]
             }
@@ -269,6 +101,16 @@ do {
             if let ch = e["checked"] as? Bool { flags.append(ch ? "checked" : "unchecked") }
             print(String(format: "%5d,%-5d  %@  [%@] %@", c.first ?? 0, c.last ?? 0, (e["class"] as? String ?? "").padding(toLength: 18, withPad: " ", startingAt: 0), flags.joined(separator: ","), label))
         }
+    case "text":
+        let r = try run("screen_text", args.isEmpty ? [:] : ["query": args.joined(separator: " ")])
+        for e in (r["lines"] ?? r["matches"]) as? [[String: Any]] ?? [] {
+            let c = e["center"] as? [Int] ?? []
+            print(String(format: "%5d,%-5d  ", c.first ?? 0, c.last ?? 0) + (e["text"] as? String ?? ""))
+        }
+    case "batch":
+        guard let j = args.first, let data = j.data(using: .utf8),
+              let steps = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { usage() }
+        printResult(try run("batch", ["actions": steps]))
     case "tap-text":
         guard !args.isEmpty else { usage() }
         printResult(try run("tap_element", ["query": args.joined(separator: " ")]))

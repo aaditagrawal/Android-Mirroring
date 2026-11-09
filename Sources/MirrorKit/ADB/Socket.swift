@@ -44,6 +44,64 @@ public final class TCPSocket {
         throw SocketError("connect \(host):\(port): \(lastError)")
     }
 
+    /// Connect to whichever host answers first ("happy eyeballs"): non-blocking connects to all
+    /// hosts at once, the first established connection wins and the rest are closed. Returns the
+    /// socket and the winning host. If every host actively refused, the error says "refused".
+    public static func connectFirst(hosts: [String], port: UInt16, timeout: TimeInterval) throws -> (TCPSocket, String) {
+        var pending: [(TCPSocket, String)] = []
+        var errors: [String] = []
+        for host in hosts {
+            var hints = addrinfo()
+            hints.ai_family = AF_UNSPEC
+            hints.ai_socktype = SOCK_STREAM
+            hints.ai_flags = AI_NUMERICSERV
+            var res: UnsafeMutablePointer<addrinfo>?
+            guard getaddrinfo(host, String(port), &hints, &res) == 0, let a = res else { errors.append("\(host): bad address"); continue }
+            defer { freeaddrinfo(res) }
+            let fd = socket(a.pointee.ai_family, a.pointee.ai_socktype, a.pointee.ai_protocol)
+            guard fd >= 0 else { continue }
+            let s = TCPSocket(fd: fd)
+            s.configure()
+            _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+            if Darwin.connect(fd, a.pointee.ai_addr, a.pointee.ai_addrlen) == 0 || errno == EINPROGRESS {
+                pending.append((s, host))
+            } else {
+                errors.append("\(host): \(String(cString: strerror(errno)))")
+                s.close()
+            }
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !pending.isEmpty {
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { break }
+            var pfds = pending.map { pollfd(fd: $0.0.fd, events: Int16(POLLOUT), revents: 0) }
+            let r = poll(&pfds, nfds_t(pfds.count), Int32(left * 1000))
+            if r <= 0 { break }
+            var stillPending: [(TCPSocket, String)] = []
+            var winner: (TCPSocket, String)?
+            for (i, p) in pending.enumerated() {
+                guard pfds[i].revents != 0 else { stillPending.append(p); continue }
+                var err: Int32 = 0
+                var len = socklen_t(MemoryLayout<Int32>.size)
+                getsockopt(p.0.fd, SOL_SOCKET, SO_ERROR, &err, &len)
+                if err == 0 && winner == nil {
+                    winner = p
+                } else {
+                    if err != 0 { errors.append("\(p.1): \(String(cString: strerror(err)))") }
+                    p.0.close()
+                }
+            }
+            if let w = winner {
+                stillPending.forEach { $0.0.close() }
+                _ = fcntl(w.0.fd, F_SETFL, fcntl(w.0.fd, F_GETFL, 0) & ~O_NONBLOCK)
+                return w
+            }
+            pending = stillPending
+        }
+        pending.forEach { errors.append("\($0.1): timed out"); $0.0.close() }
+        throw SocketError("connect :\(port): " + errors.joined(separator: ", "))
+    }
+
     private func configure() {
         var one: Int32 = 1
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
@@ -73,6 +131,11 @@ public final class TCPSocket {
     public func setReadTimeout(_ seconds: TimeInterval) {
         var tv = timeval(tv_sec: Int(seconds), tv_usec: Int32((seconds - Double(Int(seconds))) * 1_000_000))
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
+    public func setWriteTimeout(_ seconds: TimeInterval) {
+        var tv = timeval(tv_sec: Int(seconds), tv_usec: Int32((seconds - Double(Int(seconds))) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     }
 
     public func write(_ data: Data) throws {

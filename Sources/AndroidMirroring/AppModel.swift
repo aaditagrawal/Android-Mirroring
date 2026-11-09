@@ -47,6 +47,23 @@ final class AppModel: ObservableObject {
                 return WindowCapture.png(windowID: CGWindowID(w.windowNumber))
             }
         }
+        agent.presentStats = { [weak self] reset in
+            guard let self else { return [:] }
+            return DispatchQueue.main.sync {
+                guard let r = self.windowController?.mirrorView.renderer else { return ["renderer": "sample-buffer layer"] }
+                return r.report(reset: reset)
+            }
+        }
+        agent.syntheticTest = { [weak self] p in
+            guard let self else { return [:] }
+            let r: VideoRenderer? = DispatchQueue.main.sync {
+                self.windowController?.showMirror()
+                return self.windowController?.mirrorView.renderer
+            }
+            guard let r else { return ["error": "no renderer"] }
+            Thread.sleep(forTimeInterval: 0.5)
+            return r.runSynthetic(seconds: (p["seconds"] as? Double) ?? 4, jitter: (p["jitter"] as? Bool) ?? true)
+        }
         agent.connectHandler = { [weak self] in DispatchQueue.main.async { self?.autoConnect(force: true) } }
 
         devices.$devices
@@ -190,12 +207,21 @@ final class AppModel: ObservableObject {
         return URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("droidctl").path
     }
 
+    var agentCommandPath: String {
+        let bundled = URL(fileURLWithPath: droidctlPath).resolvingSymlinksInPath()
+        for path in ["/opt/homebrew/bin/droidctl", "/usr/local/bin/droidctl"] {
+            if FileManager.default.isExecutableFile(atPath: path),
+               URL(fileURLWithPath: path).resolvingSymlinksInPath() == bundled { return path }
+        }
+        return droidctlPath
+    }
+
     var mcpConfigSnippet: String {
         """
         {
           "mcpServers": {
             "android": {
-              "command": "\(droidctlPath)",
+              "command": "\(agentCommandPath)",
               "args": ["mcp"]
             }
           }
@@ -203,45 +229,5 @@ final class AppModel: ObservableObject {
         """
     }
 
-    var claudeCodeCommand: String { "claude mcp add android -s user -- \"\(droidctlPath)\" mcp" }
-}
-
-/// Stores the optional phone PIN in the macOS Keychain (used by "Unlock").
-enum Keychain {
-    private static let service = "com.aaditagrawal.AndroidMirroring.pin"
-
-    static var pin: String? {
-        get {
-            let q: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service,
-                                      kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne]
-            var out: CFTypeRef?
-            guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
-            return String(data: d, encoding: .utf8)
-        }
-        set {
-            let base: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service]
-            SecItemDelete(base as CFDictionary)
-            guard let v = newValue, !v.isEmpty else { return }
-            var add = base
-            add[kSecValueData] = Data(v.utf8)
-            add[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlocked
-            SecItemAdd(add as CFDictionary, nil)
-        }
-    }
-}
-
-/// Captures this app's own windows (no Screen Recording permission needed for own windows).
-/// CGWindowListCreateImage is marked unavailable in the SDK but still exported; resolve it dynamically.
-enum WindowCapture {
-    private typealias Fn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
-    private static let fn: Fn? = {
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else { return nil }
-        return unsafeBitCast(sym, to: Fn.self)
-    }()
-
-    static func png(windowID: CGWindowID) -> Data? {
-        // .optionIncludingWindow = 1 << 3, .boundsIgnoreFraming = 1 << 0, .bestResolution = 1 << 3
-        guard let fn, let img = fn(.null, 1 << 3, windowID, (1 << 0) | (1 << 3))?.takeRetainedValue() else { return nil }
-        return NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])
-    }
+    var claudeCodeCommand: String { "claude mcp add android -s user -- \"\(agentCommandPath)\" mcp" }
 }

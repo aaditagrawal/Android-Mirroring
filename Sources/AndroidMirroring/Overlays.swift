@@ -41,18 +41,19 @@ struct HoverToolbar: View {
                     moreMenu
                 }
                 .padding(.horizontal, 10)
-                .frame(height: 38)
+                .frame(height: MirrorWindowController.toolbarBarHeight)
                 .background(WindowDragArea())
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).strokeBorder(.white.opacity(0.12)))
-                .shadow(color: .black.opacity(0.25), radius: 8, y: 2)
-                .padding(.horizontal, 8)
-                .padding(.top, 8)
-                .transition(.move(edge: .top).combined(with: .opacity))
+                .background(Color(white: 0.11), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.white.opacity(0.08)))
+                // Slides up out of the top edge of the phone screen.
+                .transition(.offset(y: MirrorWindowController.stripHeight).combined(with: .opacity))
                 .onHover { inside in model.windowController?.toolbarHovering(inside) }
             }
-            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .clipped()
+        // The window's (hidden) title bar would otherwise push the bar down by its height.
+        .ignoresSafeArea()
         .environment(\.colorScheme, .dark)
     }
 

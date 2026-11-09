@@ -68,6 +68,14 @@ public final class DeviceManager: ObservableObject, @unchecked Sendable {
     private var learnedEndpointsFor: Set<String> = []
     private var tick = 0
     private let knownLock = NSLock()
+    private var socVendor: [String: String] = [:]
+    private let socLock = NSLock()
+
+    /// Whether the phone has a Qualcomm SoC (enables the encoder's low-latency mode).
+    public func isQualcomm(_ serial: String) -> Bool {
+        socLock.lock(); let v = socVendor[serial]; socLock.unlock()
+        return v == "QTI" || v == "Qualcomm"
+    }
     private var knownCache: [KnownDevice] = []
     /// Ids for which latency of all transports should be probed frequently (the active phone).
     public var focusDeviceId: String?
@@ -173,7 +181,7 @@ public final class DeviceManager: ObservableObject, @unchecked Sendable {
     }
 
     private func resolveIdentity(_ e: ADBDeviceEntry) {
-        let script = "getprop ro.serialno; getprop ro.product.model; getprop ro.product.manufacturer; getprop ro.build.version.release; settings get global device_name"
+        let script = "getprop ro.serialno; getprop ro.product.model; getprop ro.product.manufacturer; getprop ro.build.version.release; settings get global device_name; getprop ro.soc.manufacturer"
         guard let out = try? adb.shell(serial: e.serial, script, timeout: 6) else { return }
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         guard lines.count >= 4 else { return }
@@ -183,6 +191,7 @@ public final class DeviceManager: ObservableObject, @unchecked Sendable {
         var name = lines.count > 4 ? lines[4] : ""
         if name.isEmpty || name == "null" { name = model }
         identities[e.serial] = (id, name, model, lines[2].capitalized, lines[3])
+        if lines.count > 5 { socLock.lock(); socVendor[e.serial] = lines[5]; socLock.unlock() }
         learnEndpoints(serial: e.serial, deviceId: id, name: name, model: model)
     }
 

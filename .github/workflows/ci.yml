@@ -1,0 +1,44 @@
+name: macOS checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Toolchain
+        run: swift --version
+      - name: Check shell syntax and bundled resources
+        run: |
+          for script in scripts/*.sh android/relay/build.sh; do bash -n "$script"; done
+          scripts/check-resources.sh
+          git diff --check
+      - name: Unit tests
+        run: scripts/test.sh
+      - name: Deterministic pacing and media checks
+        run: swift run -c release mirror-selftest
+      - name: Build and verify app bundle
+        run: scripts/build-app.sh
+      - name: CLI and MCP smoke checks
+        run: scripts/check-cli.sh
+      - name: Homebrew metadata and release archive
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          scripts/package-release.sh --no-build
+          archive=$(find build -maxdepth 1 -name 'Android-Mirroring-*.zip' -print -quit)
+          scripts/generate-cask.sh "$GITHUB_REPOSITORY" "$archive"
+          brew style Formula/android-mirroring.rb build/homebrew/Casks/android-mirroring.rb

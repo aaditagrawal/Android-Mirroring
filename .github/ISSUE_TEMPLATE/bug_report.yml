@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible problem with the Mac app or agent API.
+body:
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What did you do, what happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS and Swift versions, phone model and Android version, USB or network path, app commit.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or screenshots
+      description: Remove PINs, clipboard contents, messages, phone addresses, serial numbers, and account details first.

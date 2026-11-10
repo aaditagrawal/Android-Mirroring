@@ -1,8 +1,8 @@
 # GitHub publication
 
-The checkout is prepared for a first push. Creating the GitHub repository and
-publishing it are separate steps. No remote URL, release badge, download link,
-or signing identity is assumed in the README.
+The source is public at [aaditagrawal/Android-Mirroring](https://github.com/aaditagrawal/Android-Mirroring).
+Updates go to `origin/main`. The checklist below also applies when setting up a
+new fork. App releases and signing are separate from publishing source.
 
 ## First push
 

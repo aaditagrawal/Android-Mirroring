@@ -41,6 +41,8 @@ You need macOS 14 or later, a Swift 6 or later toolchain, and Android platform
 tools. Install Xcode Command Line Tools with `xcode-select --install`, then:
 
 ```sh
+git clone https://github.com/aaditagrawal/Android-Mirroring.git
+cd Android-Mirroring
 brew install --cask android-platform-tools
 scripts/build-app.sh --install
 open -a "Android Mirroring"
@@ -56,10 +58,17 @@ installer or an automatic update service. Local builds use ad-hoc signing.
 
 ## Homebrew
 
-The repository includes a source formula for a personal tap and tooling to
-produce a cask from a checksummed release ZIP. After the GitHub repository is
-published, follow the [Homebrew guide](docs/homebrew.md) to install from `HEAD`.
-Binary cask installation becomes available after a versioned app release.
+Install the latest source through the project's Homebrew tap:
+
+```sh
+brew install --cask android-platform-tools
+brew tap aaditagrawal/android-mirroring https://github.com/aaditagrawal/Android-Mirroring
+brew install --HEAD aaditagrawal/android-mirroring/android-mirroring
+open "$(brew --prefix android-mirroring)/libexec/Android Mirroring.app"
+```
+
+See the [Homebrew guide](docs/homebrew.md) for agent setup, upgrades, and tap
+trust prompts. Binary cask installation follows a versioned app release.
 
 ## Connect your phone
 

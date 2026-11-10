@@ -5,8 +5,8 @@ for `HEAD` and generates a cask from a real release archive. A native app belong
 in Homebrew Cask for a normal binary installation; the source formula is for this
 project's tap, not submission to `homebrew/core`.
 
-The configured repository address is `aaditagrawal/Android-Mirroring`. These
-network commands work only after that repository has been published.
+The public repository is [aaditagrawal/Android-Mirroring](https://github.com/aaditagrawal/Android-Mirroring).
+Source installs build from its `main` branch.
 
 ## Install from source
 

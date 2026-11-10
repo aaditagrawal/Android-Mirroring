@@ -69,17 +69,16 @@ Source builds use ad-hoc signing too. The app has no automatic update service.
 
 ## Homebrew
 
-Install the latest source through the project's Homebrew tap:
+Install the precompiled app through the project's Homebrew tap:
 
 ```sh
-brew install --cask android-platform-tools
 brew tap aaditagrawal/android-mirroring https://github.com/aaditagrawal/Android-Mirroring
-brew install --HEAD aaditagrawal/android-mirroring/android-mirroring
-open "$(brew --prefix android-mirroring)/libexec/Android Mirroring.app"
+brew install --cask aaditagrawal/android-mirroring/android-mirroring
 ```
 
-See the [Homebrew guide](docs/homebrew.md) for agent setup, upgrades, and tap
-trust prompts and precompiled cask installation.
+The cask installs the app, `droidctl`, and Android platform tools. It contains the
+same ad-hoc signed app as the DMG. The [Homebrew guide](docs/homebrew.md) also
+covers building from `HEAD`, agent setup, upgrades, and tap trust prompts.
 
 ## Connect your phone
 

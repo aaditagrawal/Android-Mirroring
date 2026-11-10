@@ -1,7 +1,7 @@
 # Homebrew distribution
 
-This repository can act as a personal Homebrew tap. It includes a source formula
-for `HEAD` and generates a cask from a real release archive. A native app belongs
+This repository is a personal Homebrew tap. It includes a source formula for
+`HEAD` and a cask for the precompiled Apple silicon DMG. A native app belongs
 in Homebrew Cask for a normal binary installation; the source formula is for this
 project's tap, not submission to `homebrew/core`.
 
@@ -36,8 +36,7 @@ removes the Homebrew app and CLI; user settings and paired-phone data remain.
 
 ## Prepare a binary cask
 
-The precompiled DMG can also be installed as a cask after its release artifact
-is published and the matching `Casks/android-mirroring.rb` is committed:
+Install the published precompiled DMG as a cask:
 
 ```sh
 brew tap aaditagrawal/android-mirroring https://github.com/aaditagrawal/Android-Mirroring

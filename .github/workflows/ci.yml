@@ -39,6 +39,6 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: 1
         run: |
           scripts/package-release.sh --no-build
-          archive=$(find build -maxdepth 1 -name 'Android-Mirroring-*.zip' -print -quit)
+          archive=$(find build -maxdepth 1 -name 'Android-Mirroring-*.dmg' -print -quit)
           scripts/generate-cask.sh "$GITHUB_REPOSITORY" "$archive"
           brew style Formula/android-mirroring.rb build/homebrew/Casks/android-mirroring.rb

@@ -48,8 +48,44 @@ architecture. Before advertising a downloadable release:
 - Create an archive, verify its extracted signature, record SHA-256, and publish
   release notes that describe tested behavior and remaining limits.
 
-This repository supplies a build and validation workflow, not an automated signed
-release pipeline.
+## Precompiled DMG releases
+
+`scripts/package-release.sh` builds the app, creates a ZIP and a DMG with an
+Applications shortcut, verifies the mounted DMG, and writes `.sha256` sidecars.
+Use `--no-build` to package an already built or separately signed app. Packaging
+reads the version and CPU architecture from the bundle and checks that the CLI
+uses the same architecture as the app.
+
+```sh
+scripts/package-release.sh
+scripts/check-dmg.sh build/Android-Mirroring-1.0.0-arm64.dmg
+```
+
+`.github/workflows/release.yml` runs on `vMAJOR.MINOR.PATCH` tags. It builds an
+Apple silicon app on `macos-15`, runs regression checks, validates that the bundle
+version matches the tag, and uploads the precompiled DMG, ZIP, and checksums to a
+GitHub release. It uses the repository-scoped Actions token and explicitly names
+the owning repository. Uploads fail rather than overwrite existing release files.
+
+The workflow currently uses ad-hoc signing and does not notarize the app. Its
+release notes state that limitation. It does not produce an Intel binary.
+Developer ID signing and notarization remain a separate release process.
+
+A maintainer can also build and publish the same assets locally:
+
+```sh
+scripts/package-release.sh
+# Commit and push the release source, then create and push its matching tag.
+git tag -a v1.0.0 -m "Android Mirroring 1.0.0"
+git push origin v1.0.0
+gh release create v1.0.0 --repo aaditagrawal/Android-Mirroring --verify-tag \
+  --title "Android Mirroring 1.0.0" --notes-file .github/RELEASE_NOTES.md \
+  build/Android-Mirroring-1.0.0-arm64.dmg build/Android-Mirroring-1.0.0-arm64.dmg.sha256 \
+  build/Android-Mirroring-1.0.0-arm64.zip build/Android-Mirroring-1.0.0-arm64.zip.sha256
+```
+
+For a later release, bump the app and MCP version before tagging, and replace the
+example version and architecture with those of the actual artifacts.
 
 ## Homebrew
 

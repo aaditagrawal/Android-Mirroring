@@ -36,26 +36,39 @@ removes the Homebrew app and CLI; user settings and paired-phone data remain.
 
 ## Prepare a binary cask
 
-After building, signing, and notarizing a release bundle through your release
-process, package that exact bundle:
+The precompiled DMG can also be installed as a cask after its release artifact
+is published and the matching `Casks/android-mirroring.rb` is committed:
+
+```sh
+brew tap aaditagrawal/android-mirroring https://github.com/aaditagrawal/Android-Mirroring
+brew install --cask aaditagrawal/android-mirroring/android-mirroring
+```
+
+The first binary is ad-hoc signed, not Apple-notarized. Homebrew installation
+does not change that signing status. Source installation remains available.
+
+To prepare a cask from an app bundle, package the exact release build:
 
 ```sh
 scripts/package-release.sh --no-build
-scripts/generate-cask.sh aaditagrawal/Android-Mirroring build/Android-Mirroring-1.0.0-arm64.zip
+scripts/generate-cask.sh aaditagrawal/Android-Mirroring build/Android-Mirroring-1.0.0-arm64.dmg
 ```
 
 `package-release.sh` verifies the app signature, reads its actual version and
-architecture, and creates a ZIP with the app at its root and a SHA-256 sidecar.
+architecture, and creates both a ZIP and a drag-to-Applications DMG with SHA-256
+sidecars.
+It mounts the DMG read-only to verify the app signature, resources, installation
+link, and CLI/MCP behavior.
 Without `--no-build`, it first makes an ad-hoc source build. That local archive is
 useful for validation but does not establish a notarized public release.
 
-The cask generator computes the real ZIP checksum and writes
+The cask generator accepts either format, computes its checksum, and writes
 `build/homebrew/Casks/android-mirroring.rb`. It declares the app, `droidctl` binary,
 Android platform-tools dependency, minimum macOS version, and the actual CPU
 architecture. A universal bundle produces an unrestricted architecture cask.
-A single-architecture archive is not advertised as supporting both Mac types.
+A single-architecture installer is not advertised as supporting both Mac types.
 
-1. Upload the exact ZIP to a GitHub release tagged `vVERSION` in your own repo.
+1. Upload the exact DMG or ZIP to a GitHub release tagged `vVERSION` in your own repo.
 2. Confirm the public download's SHA-256 matches the local sidecar.
 3. Copy the generated definition to `Casks/android-mirroring.rb` and run
    `brew style` and `brew audit --cask --online` against the published artifact.
@@ -63,9 +76,9 @@ A single-architecture archive is not advertised as supporting both Mac types.
    `brew install --cask aaditagrawal/android-mirroring/android-mirroring`.
 
 Do not install the formula and cask at the same time; both provide `droidctl`.
-There is deliberately no active cask with an invented download URL or checksum
-before the first release. To support separate Intel and Apple silicon downloads
-in one cask later, add architecture-specific URLs and hashes from both artifacts.
+Only publish casks whose release URL and checksum have been verified. To support
+separate Intel and Apple silicon downloads in one cask later, add
+architecture-specific URLs and hashes from both artifacts.
 
 ## Validation
 
@@ -74,7 +87,7 @@ brew style Formula/android-mirroring.rb
 scripts/build-app.sh --homebrew
 scripts/check-cli.sh
 scripts/package-release.sh --no-build
-scripts/generate-cask.sh aaditagrawal/Android-Mirroring build/Android-Mirroring-1.0.0-arm64.zip
+scripts/generate-cask.sh aaditagrawal/Android-Mirroring build/Android-Mirroring-1.0.0-arm64.dmg
 brew style build/homebrew/Casks/android-mirroring.rb
 ```
 

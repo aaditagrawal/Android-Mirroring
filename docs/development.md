@@ -23,6 +23,8 @@ payloads and license notices, creates the app icon and Info.plist, and applies a
 ad-hoc signature. `--install` replaces the installed app. Builds target the host
 architecture by default; an Apple silicon build is not a universal binary.
 The GitHub workflow runs these device-free checks on a macOS runner.
+`scripts/package-release.sh --no-build` packages the bundle as a ZIP and a DMG;
+`scripts/check-dmg.sh PATH` verifies the installer by mounting it read-only.
 
 ## Tests
 

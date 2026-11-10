@@ -35,6 +35,18 @@ Screenshots of the running Mac app. No personal phone content is included.
 | --- | --- |
 | ![Picture settings with quality and motion choices](docs/images/settings-picture.png) | ![Shortcuts for navigation, touch, text, and phone controls](docs/images/settings-shortcuts.png) |
 
+## Download the app
+
+[Download the precompiled DMG for Apple silicon](https://github.com/aaditagrawal/Android-Mirroring/releases/download/v1.0.0/Android-Mirroring-1.0.0-arm64.dmg).
+Open it and drag **Android Mirroring** into **Applications**. Install ADB for
+pairing with `brew install --cask android-platform-tools`, then open the app.
+No Xcode or Swift toolchain is needed for this download.
+
+This first binary release supports Apple silicon Macs running macOS 14 or later.
+It is ad-hoc signed and **not Apple-notarized**, so macOS may block the downloaded
+app. [Releases](https://github.com/aaditagrawal/Android-Mirroring/releases) include
+SHA-256 checksums and an alternative ZIP. Intel users can build from source.
+
 ## Build and install
 
 You need macOS 14 or later, a Swift 6 or later toolchain, and Android platform
@@ -53,8 +65,7 @@ locally, and copies it to `/Applications`, or `~/Applications` if necessary. Omi
 `--install` to build only into `build/Android Mirroring.app`. An Android SDK is
 not required unless you change the relay.
 
-This is a source build. The repository does not currently supply a notarized
-installer or an automatic update service. Local builds use ad-hoc signing.
+Source builds use ad-hoc signing too. The app has no automatic update service.
 
 ## Homebrew
 
@@ -68,7 +79,7 @@ open "$(brew --prefix android-mirroring)/libexec/Android Mirroring.app"
 ```
 
 See the [Homebrew guide](docs/homebrew.md) for agent setup, upgrades, and tap
-trust prompts. Binary cask installation follows a versioned app release.
+trust prompts and precompiled cask installation.
 
 ## Connect your phone
 

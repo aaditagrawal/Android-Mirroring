@@ -1,3 +1,14 @@
+## What's new in 1.0.1
+
+- An iPhone Mirroring-style outline and attached toolbar, rendered as one
+  continuous Liquid Glass surface on macOS 26 or later.
+- Controls reveal near the top of the phone and hide while reading or scrolling.
+- Expanded windows reclaim the reserved toolbar gap while preserving the phone's
+  proportions. The outline stays outside the video, and older macOS versions use
+  a standard-material fallback.
+
+## Installation
+
 Precompiled **Apple silicon** build for macOS 14 or later.
 
 1. Download the `arm64.dmg` asset, open it, and drag Android Mirroring to Applications.

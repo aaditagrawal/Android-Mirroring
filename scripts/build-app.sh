@@ -18,7 +18,7 @@ scripts/check-resources.sh
 
 APP_NAME="Android Mirroring"
 BUNDLE_ID="com.aaditagrawal.AndroidMirroring"
-VERSION="1.0.0"
+VERSION="1.0.1"
 BUILD_DIR="build"
 APP="$BUILD_DIR/$APP_NAME.app"
 

@@ -1,6 +1,6 @@
 cask "android-mirroring" do
-  version "1.0.0"
-  sha256 "c092ef980659cbd0d8782f4ab91b67c94241c297ca79b2b0f552f707bd5fc48e"
+  version "1.0.1"
+  sha256 "843e45612719b79ef2ea0c6e780b556e697c20a02090d02cb6902ff3ed2b158d"
 
   url "https://github.com/aaditagrawal/Android-Mirroring/releases/download/v#{version}/Android-Mirroring-#{version}-arm64.dmg"
   name "Android Mirroring"

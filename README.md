@@ -37,12 +37,12 @@ Screenshots of the running Mac app. No personal phone content is included.
 
 ## Download the app
 
-[Download the precompiled DMG for Apple silicon](https://github.com/aaditagrawal/Android-Mirroring/releases/download/v1.0.0/Android-Mirroring-1.0.0-arm64.dmg).
+[Download the precompiled DMG for Apple silicon](https://github.com/aaditagrawal/Android-Mirroring/releases/download/v1.0.1/Android-Mirroring-1.0.1-arm64.dmg).
 Open it and drag **Android Mirroring** into **Applications**. Install ADB for
 pairing with `brew install --cask android-platform-tools`, then open the app.
 No Xcode or Swift toolchain is needed for this download.
 
-This first binary release supports Apple silicon Macs running macOS 14 or later.
+This binary release supports Apple silicon Macs running macOS 14 or later.
 It is ad-hoc signed and **not Apple-notarized**, so macOS may block the downloaded
 app. [Releases](https://github.com/aaditagrawal/Android-Mirroring/releases) include
 SHA-256 checksums and an alternative ZIP. Intel users can build from source.

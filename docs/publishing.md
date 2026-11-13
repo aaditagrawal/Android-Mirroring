@@ -35,7 +35,7 @@ the repository. Local validation cannot establish hosted CI results.
 
 ## Release preparation
 
-The build script currently labels bundles `1.0.0` and builds for the current Mac's
+The build script currently labels bundles `1.0.1` and builds for the current Mac's
 architecture. Before advertising a downloadable release:
 
 - Choose a release version and update the bundle and MCP server version together.
@@ -62,10 +62,14 @@ scripts/check-dmg.sh build/Android-Mirroring-1.0.0-arm64.dmg
 ```
 
 `.github/workflows/release.yml` runs on `vMAJOR.MINOR.PATCH` tags. It builds an
-Apple silicon app on `macos-15`, runs regression checks, validates that the bundle
+Apple silicon app on `macos-15` with Xcode 26.1.1, runs regression checks, validates that the bundle
 version matches the tag, and uploads the precompiled DMG, ZIP, and checksums to a
 GitHub release. It uses the repository-scoped Actions token and explicitly names
 the owning repository. Uploads fail rather than overwrite existing release files.
+
+CI and release builds explicitly select Xcode 26.1.1 so the macOS 26 Liquid Glass
+implementation is compiled into the binary. Older macOS versions use the material
+fallback; building with a pre-26 SDK compiles only that fallback.
 
 The workflow currently uses ad-hoc signing and does not notarize the app. Its
 release notes state that limitation. It does not produce an Intel binary.

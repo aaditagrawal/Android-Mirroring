@@ -13,6 +13,56 @@ struct WindowDragArea: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
+/// One glass surface for the title bar and outline, with the phone cut out of its center.
+struct MirrorChrome: View {
+    let screenRadius: CGFloat
+    var toolbarOverlaysPhone = false
+
+    var body: some View {
+        let outline = Outline(screenRadius: screenRadius, toolbarOverlaysPhone: toolbarOverlaysPhone)
+        Group {
+            #if compiler(>=6.2)
+            if #available(macOS 26, *) {
+                Color.clear.glassEffect(.regular, in: outline)
+            } else {
+                outline.fill(.regularMaterial)
+            }
+            #else
+            outline.fill(.regularMaterial)
+            #endif
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private struct Outline: Shape {
+        let screenRadius: CGFloat
+        let toolbarOverlaysPhone: Bool
+
+        func path(in rect: CGRect) -> Path {
+            let inset = MirrorWindowController.frameInset
+            let bar = MirrorWindowController.toolbarBarHeight
+            let outer = UnevenRoundedRectangle(topLeadingRadius: 14,
+                                               bottomLeadingRadius: screenRadius + inset,
+                                               bottomTrailingRadius: screenRadius + inset,
+                                               topTrailingRadius: 14)
+            var path = outer.path(in: rect)
+            let phone = CGRect(x: rect.minX + inset, y: rect.minY + bar,
+                               width: rect.width - 2 * inset, height: rect.height - bar - inset)
+            let topRadius = toolbarOverlaysPhone ? 0 : screenRadius
+            let hole = UnevenRoundedRectangle(topLeadingRadius: topRadius,
+                                              bottomLeadingRadius: screenRadius,
+                                              bottomTrailingRadius: screenRadius,
+                                              topTrailingRadius: topRadius).path(in: phone)
+            // Reverse the inner winding so the glass never covers the video beneath the frame.
+            path.addPath(hole, transform: CGAffineTransform(a: -1, b: 0, c: 0, d: 1,
+                                                           tx: phone.minX + phone.maxX, ty: 0))
+            return path
+        }
+    }
+}
+
 /// Top-of-window controls that slide in on hover (like iPhone Mirroring).
 struct HoverToolbar: View {
     @ObservedObject var model: AppModel
@@ -32,19 +82,16 @@ struct HoverToolbar: View {
             if ui.toolbarVisible {
                 HStack(spacing: 4) {
                     trafficLights
-                    Spacer(minLength: 4)
+                    Spacer(minLength: 8)
                     ToolbarButton(symbol: "chevron.backward", help: "Back (Esc, ⌘[)") { model.controller.key(AKey.back) }
-                    ToolbarButton(symbol: "circle", help: "Home (⌘1)") { model.controller.key(AKey.home) }
-                    ToolbarButton(symbol: "square.on.square", help: "Recent Apps (⌘2)") { model.controller.key(AKey.appSwitch) }
-                    Spacer(minLength: 4)
-                    pathBadge
+                    ToolbarButton(symbol: "square.grid.3x3.fill", help: "Home (⌘1)") { model.controller.key(AKey.home) }
+                    ToolbarButton(symbol: "rectangle.on.rectangle", help: "Recent Apps (⌘2)") { model.controller.key(AKey.appSwitch) }
                     moreMenu
                 }
                 .padding(.horizontal, 10)
                 .frame(height: MirrorWindowController.toolbarBarHeight)
                 .background(WindowDragArea())
-                .background(Color(white: 0.11), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.white.opacity(0.08)))
+                .foregroundStyle(.secondary)
                 // Slides up out of the top edge of the phone screen.
                 .transition(.offset(y: MirrorWindowController.stripHeight).combined(with: .opacity))
                 .onHover { inside in model.windowController?.toolbarHovering(inside) }
@@ -54,35 +101,33 @@ struct HoverToolbar: View {
         .clipped()
         // The window's (hidden) title bar would otherwise push the bar down by its height.
         .ignoresSafeArea()
-        .environment(\.colorScheme, .dark)
     }
 
     private var trafficLights: some View {
-        HStack(spacing: 7) {
-            Circle().fill(Color(nsColor: .systemRed)).frame(width: 12, height: 12)
-                .onTapGesture { window()?.performClose(nil) }
-                .help("Close")
-            Circle().fill(Color(nsColor: .systemYellow)).frame(width: 12, height: 12)
-                .onTapGesture { window()?.miniaturize(nil) }
-                .help("Minimize")
-        }
-    }
-
-    @ViewBuilder private var pathBadge: some View {
-        if let t = controller.activeTransport {
-            HStack(spacing: 3) {
-                Image(systemName: t.kind.symbol).font(.system(size: 10, weight: .semibold))
-                if let ms = t.rttMs { Text("\(Int(ms))ms").font(.system(size: 10, weight: .medium).monospacedDigit()) }
+        HStack(spacing: 8) {
+            Button { window()?.performClose(nil) } label: {
+                Circle().fill(Color(nsColor: .systemRed)).frame(width: 12, height: 12)
             }
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 6).padding(.vertical, 3)
-            .background(.white.opacity(0.08), in: Capsule())
-            .help("Connected via \(t.kind.label) (\(t.serial)) · \(controller.stats.codec) \(Int(controller.stats.fps)) fps · \(String(format: "%.1f", controller.stats.bitrateMbps)) Mbps")
+                .accessibilityLabel("Close")
+                .help("Close")
+            Button { window()?.miniaturize(nil) } label: {
+                Circle().fill(Color(nsColor: .systemYellow)).frame(width: 12, height: 12)
+            }
+                .accessibilityLabel("Minimize")
+                .help("Minimize")
+            Circle().fill(.secondary.opacity(0.2)).frame(width: 12, height: 12)
+                .accessibilityHidden(true)
         }
+        .buttonStyle(.plain)
     }
 
     private var moreMenu: some View {
         Menu {
+            if let t = controller.activeTransport {
+                Text("\(t.kind.label) · \(controller.stats.codec) · \(Int(controller.stats.fps)) fps")
+                if let ms = t.rttMs { Text("Latency: \(Int(ms)) ms") }
+                Divider()
+            }
             Button("Notifications") { model.controller.expandNotifications() }
             Button("Quick Settings") { model.controller.expandSettings() }
             Divider()
@@ -131,10 +176,11 @@ struct ToolbarButton: View {
             Image(systemName: symbol)
                 .font(.system(size: 13, weight: .semibold))
                 .frame(width: 30, height: 26)
-                .background(hover.value ? Color.white.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .background(hover.value ? Color.primary.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(.plain)
         .onHover { hover.value = $0 }
+        .accessibilityLabel(help)
         .help(help)
     }
 }

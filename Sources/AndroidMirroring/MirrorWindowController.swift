@@ -45,14 +45,17 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var hideToolbarWork: DispatchWorkItem?
     private let container = NSView()
-    /// The rounded phone screen. The toolbar lives in a strip above it, never on top of it.
+    private let chrome = PassthroughHostingView(rootView: MirrorChrome(screenRadius: 28))
+    /// The rounded phone screen. At maximum height the toolbar overlays it to save space.
     private let screenView = NSView()
+    private var screenTop: NSLayoutConstraint!
     private var videoAspect: CGSize?
     static let cornerRadiusFraction: CGFloat = 0.075
-    /// Toolbar strip above the screen: 36 pt bar + 8 pt gap.
+    /// Keep the material frame outside the video so no phone pixels are covered by the outline.
+    static let frameInset: CGFloat = 6
+    /// Attached title bar, like iPhone Mirroring; no gap between the bar and phone.
     static let toolbarBarHeight: CGFloat = 36
-    static let toolbarGap: CGFloat = 8
-    static var stripHeight: CGFloat { toolbarBarHeight + toolbarGap }
+    static var stripHeight: CGFloat { toolbarBarHeight }
 
     init(model: AppModel) {
         self.model = model
@@ -79,7 +82,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         w.delegate = self
         w.title = "Android Mirroring"
         w.setFrameAutosaveName("MirrorWindow")
-        w.minSize = NSSize(width: 200, height: 300 + MirrorWindowController.stripHeight)
+        w.minSize = NSSize(width: 240, height: 300 + MirrorWindowController.stripHeight + Self.frameInset)
         for b in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             w.standardWindowButton(b)?.isHidden = true
         }
@@ -96,12 +99,17 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         // above the screen to whatever is behind the window.
         w.contentView = container
 
+        chrome.sizingOptions = []
+        chrome.isHidden = true
+        chrome.translatesAutoresizingMaskIntoConstraints = false
+
         screenView.wantsLayer = true
         screenView.layer?.cornerCurve = .continuous
         screenView.layer?.masksToBounds = true
         screenView.layer?.backgroundColor = NSColor.black.cgColor
         screenView.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(screenView)
+        container.addSubview(chrome, positioned: .above, relativeTo: screenView)
 
         mirrorView.translatesAutoresizingMaskIntoConstraints = false
         screenView.addSubview(mirrorView)
@@ -114,14 +122,19 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         let toolbar = PassthroughHostingView(rootView: HoverToolbar(model: model, ui: ui, window: { [weak self] in self?.window }))
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.sizingOptions = []
-        // Below the screen in z-order, so the bar slides out from behind the screen's top edge.
-        container.addSubview(toolbar, positioned: .below, relativeTo: screenView)
+        // Controls sit above one continuous glass surface in both windowed and expanded layouts.
+        container.addSubview(toolbar, positioned: .above, relativeTo: chrome)
 
+        screenTop = screenView.topAnchor.constraint(equalTo: container.topAnchor, constant: strip)
         NSLayoutConstraint.activate([
-            screenView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            screenView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            screenView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            screenView.topAnchor.constraint(equalTo: container.topAnchor, constant: MirrorWindowController.stripHeight),
+            chrome.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            chrome.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            chrome.topAnchor.constraint(equalTo: container.topAnchor),
+            chrome.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            screenView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.frameInset),
+            screenView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.frameInset),
+            screenView.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -Self.frameInset),
+            screenTop,
             mirrorView.leadingAnchor.constraint(equalTo: screenView.leadingAnchor),
             mirrorView.trailingAnchor.constraint(equalTo: screenView.trailingAnchor),
             mirrorView.topAnchor.constraint(equalTo: screenView.topAnchor),
@@ -140,12 +153,13 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         mirrorView.onFileDrop = { [weak self] urls in self?.model.handleDrop(urls, ui: self!.ui) }
         ui.$toolbarVisible
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
+            .sink { [weak self] visible in
+                self?.chrome.isHidden = !visible
                 // The window shadow follows its opaque pixels; refresh it once the bar has animated.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self?.window?.invalidateShadow() }
             }
             .store(in: &cancellables)
-        updateCornerRadius()
+        windowDidResize(Notification(name: NSWindow.didResizeNotification))
     }
 
     private func bind() {
@@ -176,31 +190,52 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: Sizing
 
-    private var strip: CGFloat { MirrorWindowController.stripHeight }
+    private var fillsScreenHeight: Bool {
+        guard let w = window, let display = w.screen?.visibleFrame else { return false }
+        return w.frame.height >= display.height - 1
+    }
 
-    /// Window size for a screen area of the given size (the strip sits on top).
+    private var strip: CGFloat { fillsScreenHeight ? 0 : MirrorWindowController.stripHeight }
+    private var screenTopInset: CGFloat { fillsScreenHeight ? Self.frameInset : strip }
+    private var verticalChrome: CGFloat { screenTopInset + Self.frameInset }
+
+    /// Reserve space for controls unless the phone can fill the display's available height.
     private func windowSize(screen: NSSize) -> NSSize {
-        NSSize(width: screen.width.rounded(), height: (screen.height + strip).rounded())
+        let bar = MirrorWindowController.stripHeight
+        let inset = Self.frameInset
+        if let display = window?.screen?.visibleFrame,
+           screen.height + bar + inset >= display.height,
+           screen.width * (display.height - 2 * inset) / screen.height + 2 * inset <= display.width {
+            return NSSize(width: (screen.width * (display.height - 2 * inset) / screen.height + 2 * inset).rounded(), height: display.height)
+        }
+        return NSSize(width: (screen.width + 2 * inset).rounded(), height: (screen.height + bar + inset).rounded())
     }
 
     private func applyAspect(_ size: CGSize) {
         guard let w = window, size.width > 0, size.height > 0 else { return }
         videoAspect = size
+        if fillsScreenHeight, let display = w.screen?.visibleFrame,
+           (display.height - 2 * Self.frameInset) * size.width / size.height + 2 * Self.frameInset <= display.width {
+            let width = (display.height - 2 * Self.frameInset) * size.width / size.height + 2 * Self.frameInset
+            w.setFrame(NSRect(x: display.midX - width / 2, y: display.minY,
+                              width: width, height: display.height), display: true)
+            return
+        }
         let frame = w.frame
-        let screenArea = NSSize(width: frame.width, height: frame.height - strip)
+        let screenArea = NSSize(width: frame.width - 2 * Self.frameInset, height: frame.height - verticalChrome)
         let display = w.screen?.visibleFrame ?? NSScreen.main!.visibleFrame
         // Keep the current height (or width when rotating to landscape), within the display.
         let portrait = size.height >= size.width
         var newScreen: NSSize
         if portrait {
             var h = screenArea.height
-            if screenArea.width > screenArea.height { h = min(display.height * 0.85 - strip, screenArea.width) } // was landscape
-            h = min(h, display.height * 0.95 - strip)
+            if screenArea.width > screenArea.height { h = min(display.height * 0.85 - strip - Self.frameInset, screenArea.width) } // was landscape
+            h = min(h, display.height * 0.95 - strip - Self.frameInset)
             newScreen = NSSize(width: h * size.width / size.height, height: h)
         } else {
             var wd = screenArea.width
             if screenArea.height > screenArea.width { wd = min(display.width * 0.7, screenArea.height) }
-            wd = min(wd, display.width * 0.95)
+            wd = min(wd, display.width * 0.95 - 2 * Self.frameInset)
             newScreen = NSSize(width: wd, height: wd * size.height / size.width)
         }
         let newSize = windowSize(screen: newScreen)
@@ -215,18 +250,24 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         let cur = sender.frame.size
         let widthLed = abs(frameSize.width - cur.width) >= abs(frameSize.height - cur.height)
         if widthLed {
-            return windowSize(screen: NSSize(width: frameSize.width, height: frameSize.width * a.height / a.width))
+            let width = max(1, frameSize.width - 2 * Self.frameInset)
+            return windowSize(screen: NSSize(width: width, height: width * a.height / a.width))
         }
-        let h = max(1, frameSize.height - strip)
+        let h = max(1, frameSize.height - MirrorWindowController.stripHeight - Self.frameInset)
         return windowSize(screen: NSSize(width: h * a.width / a.height, height: h))
     }
 
-    func windowDidResize(_ notification: Notification) { updateCornerRadius() }
+    func windowDidResize(_ notification: Notification) {
+        guard let screenTop else { return }
+        screenTop.constant = screenTopInset
+        updateCornerRadius()
+    }
 
     private func updateCornerRadius() {
         guard let w = window else { return }
-        let r = min(w.frame.width, w.frame.height - strip) * MirrorWindowController.cornerRadiusFraction
+        let r = min(w.frame.width - 2 * Self.frameInset, w.frame.height - verticalChrome) * MirrorWindowController.cornerRadiusFraction
         screenView.layer?.cornerRadius = max(10, r)
+        chrome.rootView = MirrorChrome(screenRadius: max(10, r), toolbarOverlaysPhone: fillsScreenHeight)
         w.invalidateShadow()
     }
 
@@ -245,8 +286,8 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         guard let w = window else { return }
         let f = w.frame
         let display = w.screen?.visibleFrame ?? NSScreen.main!.visibleFrame
-        var screen = NSSize(width: f.width * factor, height: (f.height - strip) * factor)
-        let maxH = display.height - strip
+        var screen = NSSize(width: (f.width - 2 * Self.frameInset) * factor, height: (f.height - verticalChrome) * factor)
+        let maxH = display.height - MirrorWindowController.stripHeight - Self.frameInset
         if screen.height > maxH { screen = NSSize(width: screen.width * maxH / screen.height, height: maxH) }
         if screen.height < 300 { return }
         let size = windowSize(screen: screen)
@@ -256,8 +297,11 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     // MARK: Hover toolbar
 
     private func hover(_ p: CGPoint?) {
-        // The bar sits outside the screen, so it can show whenever the pointer is over the
-        // phone without covering anything (as in iPhone Mirroring).
+        // Match iPhone Mirroring: reveal controls at the top, not while reading or scrolling.
+        if let p, p.y < mirrorView.bounds.height - MirrorWindowController.toolbarBarHeight {
+            scheduleHideToolbar(0.8)
+            return
+        }
         guard p != nil else { scheduleHideToolbar(0.8); return }
         hideToolbarWork?.cancel()
         if !ui.toolbarVisible { withAnimation(.spring(duration: 0.28, bounce: 0.15)) { ui.toolbarVisible = true } }

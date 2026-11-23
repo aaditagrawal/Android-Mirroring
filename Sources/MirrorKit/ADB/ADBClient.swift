@@ -332,7 +332,7 @@ public final class ADBClient: @unchecked Sendable {
 /// Wrapper around the `adb` executable for the few operations that need it
 /// (pairing, starting the server, installs with streaming progress).
 public enum ADBTool {
-    public static var executablePath: String? = {
+    public static var executablePath: String? {
         if let custom = UserDefaults.standard.string(forKey: "adbPath"), FileManager.default.isExecutableFile(atPath: custom) {
             return custom
         }
@@ -351,7 +351,7 @@ public enum ADBTool {
             if FileManager.default.isExecutableFile(atPath: p) { return p }
         }
         return nil
-    }()
+    }
 
     @discardableResult
     public static func run(_ args: [String], timeout: TimeInterval = 60, input: String? = nil) throws -> (status: Int32, output: String) {

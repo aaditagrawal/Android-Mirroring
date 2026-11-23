@@ -12,11 +12,16 @@ final class AppModel: ObservableObject {
     let notifications: NotificationBridge
     weak var windowController: MirrorWindowController?
     var showDevicesWindow: (() -> Void)?
+    var showConnectedMirror: (() -> Void)?
     var showSettingsWindow: (() -> Void)?
 
     @Published var phoneScreenOff = false
+    @Published private(set) var selectedPhoneID: String?
     private var cancellables = Set<AnyCancellable>()
     private var autoConnectDone = false
+    private var openWhenReady = false
+    private var pendingFavorite: FavoriteApp?
+    private var requestedNotifications = false
     private var lastDeviceId: String? {
         get { UserDefaults.standard.string(forKey: "lastDeviceId") }
         set { UserDefaults.standard.set(newValue, forKey: "lastDeviceId") }
@@ -73,8 +78,28 @@ final class AppModel: ObservableObject {
         controller.$state
             .receive(on: DispatchQueue.main)
             .sink { [weak self] s in
-                if case .streaming = s { self?.notifications.start() }
                 if case .idle = s { self?.notifications.stop(); self?.phoneScreenOff = false }
+            }
+            .store(in: &cancellables)
+        controller.$state.combineLatest(controller.$hasVideo)
+            .map { $0 == .streaming && $1 }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] ready in
+                guard let self, ready, self.controller.isStreaming, self.controller.hasVideo else { return }
+                if NotificationBridge.enabled, !self.requestedNotifications {
+                    self.requestedNotifications = true
+                    self.notifications.requestAuthorization()
+                }
+                self.notifications.start()
+                guard self.controller.device?.id == self.selectedPhoneID, self.openWhenReady else { return }
+                self.openWhenReady = false
+                self.showConnectedMirror?()
+                self.windowController?.revealToolbarOnFirstConnect()
+                if let app = self.pendingFavorite {
+                    self.pendingFavorite = nil
+                    self.launch(app)
+                }
             }
             .store(in: &cancellables)
     }
@@ -82,11 +107,6 @@ final class AppModel: ObservableObject {
     func start() {
         devices.start()
         do { try agent.start() } catch { Log.error("agent server: \(error)") }
-        // If nothing connects within a few seconds and we've never paired, show the device window.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            guard let self else { return }
-            if !self.controller.state.isActive && self.devices.devices.isEmpty { self.showDevices() }
-        }
     }
 
     // MARK: Connection
@@ -94,49 +114,133 @@ final class AppModel: ObservableObject {
     /// Connect to the last-used phone (or the only phone) as soon as it shows up.
     func autoConnect(force: Bool) {
         guard force || !autoConnectDone else { return }
-        guard !controller.state.isActive || force else { return }
-        if controller.state.isActive { return }
+        guard !controller.state.isActive else { return }
         let list = devices.devices
-        guard !list.isEmpty else { return }
-        let target = list.first(where: { $0.id == lastDeviceId }) ?? (list.count == 1 ? list[0] : nil)
+        let target: PhoneDevice?
+        if let id = lastDeviceId { target = devices.device(id: id) }
+        else { target = list.count == 1 ? list.first : nil }
         guard let target else { return }
-        autoConnectDone = true
         connect(target.id)
     }
 
     func connect(_ id: String) {
+        connect(id, opening: nil)
+    }
+
+    private func connect(_ id: String, opening app: FavoriteApp?) {
+        autoConnectDone = true
+        if selectedPhoneID == id, controller.device?.id == id, controller.isStreaming, controller.hasVideo {
+            showConnectedMirror?()
+            if let app { launch(app) }
+            return
+        }
+        if selectedPhoneID != id, phoneScreenOff { setPhoneScreenOff(false) }
+        let alreadyConnecting = selectedPhoneID == id && controller.state.isActive
+        selectedPhoneID = id
         lastDeviceId = id
-        controller.connect(deviceId: id)
-        windowController?.showMirror()
+        pendingFavorite = app
+        openWhenReady = true
+        if !alreadyConnecting { controller.connect(deviceId: id) }
     }
 
     func reconnect() {
-        if let id = lastDeviceId ?? devices.devices.first?.id { connect(id) } else { showDevices() }
+        if let phone = preferredPhone { connect(phone.id) } else { showDevices() }
     }
 
     func disconnect() {
+        autoConnectDone = true
+        openWhenReady = false
+        pendingFavorite = nil
+        selectedPhoneID = nil
         if phoneScreenOff { controller.setDisplayPower(true) }
         controller.disconnect()
     }
 
-    var canQuickConnect: Bool { !devices.devices.isEmpty }
+    var preferredPhone: (id: String, name: String)? {
+        if let id = lastDeviceId {
+            if let phone = devices.device(id: id) { return (id, phone.name) }
+            if let phone = devices.known.first(where: { $0.id == id }) { return (id, phone.name) }
+        }
+        if devices.devices.count == 1, let phone = devices.devices.first { return (phone.id, phone.name) }
+        if devices.devices.isEmpty, devices.known.count == 1, let phone = devices.known.first { return (phone.id, phone.name) }
+        return nil
+    }
+
+    var selectedPhoneName: String {
+        guard let id = selectedPhoneID else { return "your phone" }
+        return devices.device(id: id)?.name ?? devices.known.first { $0.id == id }?.name ?? "your phone"
+    }
 
     var idleHint: String {
-        if let e = devices.serverError { return e }
         if devices.pending.contains(where: { $0.state == "unauthorized" }) {
             return "Your phone is asking for permission. Unlock it and tap “Allow” on the USB debugging prompt."
         }
-        if devices.devices.isEmpty { return "Pair your phone using Wireless Debugging to get started." }
-        return "\(devices.devices.first!.name) is available."
+        if devices.serverError != nil { return "Open Phones to check your connection setup." }
+        return preferredPhone == nil ? "Choose a phone or connect one by USB or Wi-Fi." : "Ready when your phone is available."
     }
 
     func showDevices() { showDevicesWindow?() }
 
+    func showShortcuts() {
+        UserDefaults.standard.set("shortcuts", forKey: "settingsTab")
+        showSettingsWindow?()
+    }
+
+    func forgetPhone(_ id: String) {
+        if selectedPhoneID == id { disconnect() }
+        if lastDeviceId == id { lastDeviceId = nil }
+        var saved = favorites
+        saved[id] = nil
+        favorites = saved
+        devices.forget(id)
+    }
+
     func windowClosed() {
-        // Keep the session alive in the background for agents unless the user opted out.
+        connectionWindowClosed()
         if !(UserDefaults.standard.object(forKey: "keepConnectedWhenClosed") as? Bool ?? true) {
             disconnect()
+        } else if controller.isStreaming && controller.hasVideo && !UserDefaults.standard.bool(forKey: "explainedBackgroundConnection") {
+            let alert = NSAlert()
+            alert.messageText = "Keep mirroring in the background?"
+            alert.informativeText = "Use the Android Mirroring menu bar icon to show the phone again or disconnect. You can change this behavior in Settings."
+            alert.addButton(withTitle: "Keep Connected")
+            alert.addButton(withTitle: "Disconnect")
+            UserDefaults.standard.set(true, forKey: "explainedBackgroundConnection")
+            if alert.runModal() == .alertSecondButtonReturn { disconnect() }
         }
+    }
+
+    func connectionWindowClosed() {
+        openWhenReady = false
+        pendingFavorite = nil
+    }
+
+    // MARK: App favorites
+
+    private var favorites: [String: [FavoriteApp]] {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: "favoriteApps") else { return [:] }
+            return (try? JSONDecoder().decode([String: [FavoriteApp]].self, from: data)) ?? [:]
+        }
+        set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: "favoriteApps") }
+    }
+
+    func favoriteApps(on id: String) -> [FavoriteApp] { favorites[id] ?? [] }
+
+    func setFavoriteApps(_ apps: [FavoriteApp], on id: String) {
+        var saved = favorites
+        saved[id] = apps.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+        favorites = saved
+    }
+
+    func openFavorite(_ app: FavoriteApp, on id: String) {
+        connect(id, opening: app)
+        if openWhenReady { showDevices() }
+    }
+
+    private func launch(_ app: FavoriteApp) {
+        controller.startApp(app.package)
+        windowController?.ui.show(toast: "Opening \(app.label) · Unlock your phone if asked")
     }
 
     // MARK: Actions

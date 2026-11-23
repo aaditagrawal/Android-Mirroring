@@ -3,11 +3,12 @@ import Combine
 import MirrorKit
 import SwiftUI
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     let model = AppModel()
     var mirror: MirrorWindowController!
     var devicesWindow: NSWindow?
     var settingsWindow: NSWindow?
+    var favoritesWindow: NSWindow?
     var statusItem: NSStatusItem!
     private var cancellables = Set<AnyCancellable>()
 
@@ -22,6 +23,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mirror = MirrorWindowController(model: model)
         model.windowController = mirror
         model.showDevicesWindow = { [weak self] in self?.showDevices() }
+        model.showConnectedMirror = { [weak self] in
+            self?.devicesWindow?.orderOut(nil)
+            self?.mirror.showMirror()
+        }
         model.showSettingsWindow = { [weak self] in self?.showSettings() }
         model.notifications.onOpen = { [weak self] pkg in
             self?.model.controller.startApp(pkg)
@@ -29,11 +34,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         buildMainMenu()
         buildStatusItem()
-        model.notifications.requestAuthorization()
         model.start()
-        mirror.showMirror()
+        showDevices()
 
-        model.controller.$state.combineLatest(model.controller.$activeTransport)
+        model.controller.$state.combineLatest(model.controller.$hasVideo)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _, _ in self?.updateStatusIcon() }
             .store(in: &cancellables)
@@ -42,7 +46,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag { mirror.showMirror() }
+        if !flag {
+            if model.controller.state.isActive { mirror.showMirror() } else { showDevices() }
+        }
         return true
     }
 
@@ -62,6 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             w.title = "Phones"
             w.titlebarAppearsTransparent = true
             w.isReleasedWhenClosed = false
+            w.delegate = self
             w.contentView = NSHostingView(rootView: DevicesView(model: model))
             w.center()
             w.setFrameAutosaveName("DevicesWindow")
@@ -70,6 +77,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         devicesWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
+
+    func windowWillClose(_ notification: Notification) { model.connectionWindowClosed() }
 
     @objc func showSettings() {
         if settingsWindow == nil {
@@ -86,6 +95,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func showMirror() { mirror.showMirror() }
+
+    @objc func manageFavorites() {
+        guard model.controller.isStreaming, let phone = model.controller.device else { return }
+        let w = favoritesWindow ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 430, height: 460),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Favorite Apps"
+        w.isReleasedWhenClosed = false
+        w.contentView = NSHostingView(rootView: FavoriteAppsView(model: model, phone: phone))
+        if favoritesWindow == nil { w.center() }
+        favoritesWindow = w
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     // MARK: Menu actions
 
@@ -105,7 +127,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func zoomIn() { mirror.zoom(by: 1.15) }
     @objc func zoomOut() { mirror.zoom(by: 1 / 1.15) }
     @objc func disconnect() { model.disconnect() }
-    @objc func reconnect() { model.reconnect() }
+    @objc func reconnect() {
+        if !model.controller.isStreaming && mirror.window?.isVisible != true { showDevices() }
+        model.reconnect()
+    }
+    @objc func toggleControls() { mirror.togglePinnedToolbar() }
     @objc func toggleFloat() {
         guard let w = mirror.window else { return }
         w.level = w.level == .floating ? .normal : .floating
@@ -115,12 +141,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch item.action {
         case #selector(toggleScreenOff): item.state = model.phoneScreenOff ? .on : .off
         case #selector(toggleFloat): item.state = mirror.window?.level == .floating ? .on : .off
+        case #selector(toggleControls): item.state = mirror.ui.toolbarPinned ? .on : .off
+        case #selector(disconnect): return model.controller.state.isActive
         default: break
         }
         let needsSession: Set<Selector?> = [#selector(home), #selector(back), #selector(recents), #selector(notifications),
                                              #selector(quickSettings), #selector(volumeUp), #selector(volumeDown), #selector(rotate),
                                              #selector(lock), #selector(unlock), #selector(screenshot), #selector(toggleScreenOff),
-                                             #selector(actualSize), #selector(disconnect)]
+                                             #selector(actualSize), #selector(manageFavorites)]
         if needsSession.contains(item.action) { return model.controller.isStreaming }
         return true
     }
@@ -166,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addItem(item("Make Bigger", #selector(zoomIn), "+"))
         view.addItem(item("Make Smaller", #selector(zoomOut), "-"))
         view.addItem(.separator())
+        view.addItem(item("Keep Controls Visible", #selector(toggleControls), "t", [.command, .shift]))
         view.addItem(item("Keep on Top", #selector(toggleFloat), "t", [.command, .option]))
         main.addItem(submenu("View", view))
 
@@ -183,6 +212,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         phone.addItem(item("Turn Phone Screen Off", #selector(toggleScreenOff), "o", [.command, .option]))
         phone.addItem(item("Lock", #selector(lock), "l"))
         phone.addItem(item("Unlock", #selector(unlock), "u", [.command, .option]))
+        phone.addItem(.separator())
+        phone.addItem(item("Manage Favorite Apps…", #selector(manageFavorites), ""))
         main.addItem(submenu("Phone", phone))
 
         let window = NSMenu(title: "Window")
@@ -220,11 +251,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateStatusIcon() {
         let symbol: String
-        switch model.controller.state {
-        case .streaming: symbol = "smartphone"
-        case .connecting, .reconnecting: symbol = "arrow.triangle.2.circlepath"
-        default: symbol = "iphone.slash"
-        }
+        let live = model.controller.isStreaming && model.controller.hasVideo
+        if live { symbol = "iphone" }
+        else if model.controller.state.isActive { symbol = "arrow.triangle.2.circlepath" }
+        else { symbol = "iphone.slash" }
         let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "Android Mirroring")
         img?.isTemplate = true
         statusItem.button?.image = img
@@ -233,8 +263,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let c = model.controller
-        if let d = c.device, c.state.isActive {
-            let title = NSMenuItem(title: d.name, action: nil, keyEquivalent: "")
+        if c.state.isActive {
+            let live = c.isStreaming && c.hasVideo
+            let title = NSMenuItem(title: "\(model.selectedPhoneName) · \(live ? "Mirroring" : "Connecting")", action: nil, keyEquivalent: "")
             title.isEnabled = false
             menu.addItem(title)
             if let t = c.activeTransport {
@@ -242,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 s.isEnabled = false
                 menu.addItem(s)
             }
-            if d.transports.count > 1 {
+            if live, let d = c.device, d.transports.count > 1 {
                 let paths = NSMenu()
                 for t in d.transports {
                     let i = NSMenuItem(title: t.label, action: #selector(switchPath(_:)), keyEquivalent: "")
@@ -257,20 +288,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             menu.addItem(.separator())
             menu.addItem(item("Show Phone", #selector(showMirror), ""))
-            let so = item("Phone Screen Off", #selector(toggleScreenOff), "")
-            so.state = model.phoneScreenOff ? .on : .off
-            menu.addItem(so)
-            menu.addItem(item("Disconnect", #selector(disconnect), ""))
+            if live { menu.addItem(item("Phone Screen Off", #selector(toggleScreenOff), "")) }
+            menu.addItem(item(live ? "Disconnect" : "Cancel Connection", #selector(disconnect), ""))
         } else {
-            for d in model.devices.devices {
-                let i = NSMenuItem(title: "Mirror \(d.name)", action: #selector(connectDevice(_:)), keyEquivalent: "")
-                i.representedObject = d.id
-                i.target = self
-                menu.addItem(i)
+            if let phone = model.preferredPhone {
+                let verb = model.devices.device(id: phone.id) == nil ? "Reconnect" : "Open"
+                let open = item("\(verb) \(phone.name)", #selector(connectDevice(_:)), "")
+                open.representedObject = phone.id
+                menu.addItem(open)
             }
-            if model.devices.devices.isEmpty {
-                let i = NSMenuItem(title: "No phones connected", action: nil, keyEquivalent: "")
-                i.isEnabled = false
+        }
+        if let id = model.selectedPhoneID ?? model.preferredPhone?.id {
+            let apps = model.favoriteApps(on: id)
+            if !apps.isEmpty || c.isStreaming {
+                let favorites = NSMenu()
+                for app in apps {
+                    let i = item(app.label, #selector(openFavorite(_:)), "")
+                    i.representedObject = (id, app)
+                    favorites.addItem(i)
+                }
+                if c.isStreaming {
+                    if !apps.isEmpty { favorites.addItem(.separator()) }
+                    favorites.addItem(item("Manage Favorites…", #selector(manageFavorites), ""))
+                }
+                let i = NSMenuItem(title: "Favorite Apps", action: nil, keyEquivalent: "")
+                i.submenu = favorites
                 menu.addItem(i)
             }
         }
@@ -286,7 +328,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func connectDevice(_ sender: NSMenuItem) {
-        if let id = sender.representedObject as? String { model.connect(id) }
+        guard let id = sender.representedObject as? String else { return }
+        showDevices()
+        model.connect(id)
+    }
+
+    @objc func openFavorite(_ sender: NSMenuItem) {
+        if let (id, app) = sender.representedObject as? (String, FavoriteApp) { model.openFavorite(app, on: id) }
     }
 }
 

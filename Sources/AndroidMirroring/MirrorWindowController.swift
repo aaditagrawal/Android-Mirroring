@@ -6,6 +6,7 @@ import SwiftUI
 /// Observable UI state shared by the window chrome overlays.
 final class WindowUIState: ObservableObject {
     @Published var toolbarVisible = false
+    @Published var toolbarPinned = UserDefaults.standard.bool(forKey: "keepMirrorControlsVisible")
     @Published var toast: String?
     @Published var progress: String?
     private var toastWork: DispatchWorkItem?
@@ -44,6 +45,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     let ui = WindowUIState()
     private var cancellables = Set<AnyCancellable>()
     private var hideToolbarWork: DispatchWorkItem?
+    private var revealUntil = Date.distantPast
     private let container = NSView()
     private let chrome = PassthroughHostingView(rootView: MirrorChrome(screenRadius: 28))
     /// The rounded phone screen. At maximum height the toolbar overlays it to save space.
@@ -64,6 +66,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                                   backing: .buffered, defer: false)
         super.init(window: window)
+        ui.toolbarVisible = ui.toolbarPinned
         configureWindow(window)
         buildContent(window)
         bind()
@@ -114,7 +117,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         mirrorView.translatesAutoresizingMaskIntoConstraints = false
         screenView.addSubview(mirrorView)
 
-        let overlay = PassthroughHostingView(rootView: MirrorOverlay(controller: model.controller, model: model, ui: ui))
+        let overlay = PassthroughHostingView(rootView: MirrorOverlay(controller: model.controller, model: model, ui: ui, devices: model.devices))
         overlay.translatesAutoresizingMaskIntoConstraints = false
         overlay.sizingOptions = []   // never let SwiftUI content drive the window size
         screenView.addSubview(overlay)
@@ -296,6 +299,28 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: Hover toolbar
 
+    func revealToolbarOnFirstConnect() {
+        let key = "introducedMirrorControls"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        UserDefaults.standard.set(true, forKey: key)
+        revealUntil = Date().addingTimeInterval(4)
+        updateToolbar(visible: true)
+        scheduleHideToolbar(4)
+    }
+
+    func togglePinnedToolbar() {
+        ui.toolbarPinned.toggle()
+        UserDefaults.standard.set(ui.toolbarPinned, forKey: "keepMirrorControlsVisible")
+        hideToolbarWork?.cancel()
+        updateToolbar(visible: ui.toolbarPinned)
+    }
+
+    private func updateToolbar(visible: Bool) {
+        guard ui.toolbarVisible != visible else { return }
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) { ui.toolbarVisible = visible }
+    }
+
     private func hover(_ p: CGPoint?) {
         // Match iPhone Mirroring: reveal controls at the top, not while reading or scrolling.
         if let p, p.y < mirrorView.bounds.height - MirrorWindowController.toolbarBarHeight {
@@ -304,16 +329,15 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         }
         guard p != nil else { scheduleHideToolbar(0.8); return }
         hideToolbarWork?.cancel()
-        if !ui.toolbarVisible { withAnimation(.spring(duration: 0.28, bounce: 0.15)) { ui.toolbarVisible = true } }
+        updateToolbar(visible: true)
     }
 
     private func scheduleHideToolbar(_ delay: Double) {
         hideToolbarWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in
-            withAnimation(.easeIn(duration: 0.2)) { self?.ui.toolbarVisible = false }
-        }
+        guard !ui.toolbarPinned else { return }
+        let w = DispatchWorkItem { [weak self] in self?.updateToolbar(visible: false) }
         hideToolbarWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: w)
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, revealUntil.timeIntervalSinceNow), execute: w)
     }
 
     func toolbarHovering(_ inside: Bool) {

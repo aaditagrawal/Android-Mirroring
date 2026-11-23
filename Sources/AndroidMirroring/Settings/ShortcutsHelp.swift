@@ -22,6 +22,7 @@ struct ShortcutsHelp: View {
         ("Phone", [
             (["⌘↑", "⌘↓"], "Volume"), (["⌘R"], "Rotate"), (["⌘L"], "Lock"), (["⌘⇧S"], "Screenshot to Desktop"),
             (["⌘0", "⌘+", "⌘−"], "Actual size, bigger, smaller"),
+            (["⌘⇧T"], "Keep controls visible"),
         ]),
         ("Drop", [(["APK"], "Install it"), (["Any file"], "Copy to Downloads")]),
     ]

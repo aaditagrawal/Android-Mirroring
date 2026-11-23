@@ -83,9 +83,12 @@ struct HoverToolbar: View {
                 HStack(spacing: 4) {
                     trafficLights
                     Spacer(minLength: 8)
-                    ToolbarButton(symbol: "chevron.backward", help: "Back (Esc, ⌘[)") { model.controller.key(AKey.back) }
-                    ToolbarButton(symbol: "square.grid.3x3.fill", help: "Home (⌘1)") { model.controller.key(AKey.home) }
-                    ToolbarButton(symbol: "rectangle.on.rectangle", help: "Recent Apps (⌘2)") { model.controller.key(AKey.appSwitch) }
+                    Group {
+                        ToolbarButton(symbol: "chevron.backward", help: "Back (Esc, ⌘[)") { model.controller.key(AKey.back) }
+                        ToolbarButton(symbol: "square.grid.3x3.fill", help: "Home (⌘1)") { model.controller.key(AKey.home) }
+                        ToolbarButton(symbol: "rectangle.on.rectangle", help: "Recent Apps (⌘2)") { model.controller.key(AKey.appSwitch) }
+                    }
+                    .disabled(!controller.isStreaming)
                     moreMenu
                 }
                 .padding(.horizontal, 10)
@@ -123,45 +126,55 @@ struct HoverToolbar: View {
 
     private var moreMenu: some View {
         Menu {
-            if let t = controller.activeTransport {
-                Text("\(t.kind.label) · \(controller.stats.codec) · \(Int(controller.stats.fps)) fps")
-                if let ms = t.rttMs { Text("Latency: \(Int(ms)) ms") }
+            Toggle("Keep Controls Visible", isOn: Binding(get: { ui.toolbarPinned }, set: { _ in model.windowController?.togglePinnedToolbar() }))
+            Button("Keyboard & Trackpad Shortcuts…") { model.showShortcuts() }
+            if controller.isStreaming {
                 Divider()
+                phoneControls
+                Divider()
+                Button("Disconnect") { model.disconnect() }
             }
-            Button("Notifications") { model.controller.expandNotifications() }
-            Button("Quick Settings") { model.controller.expandSettings() }
-            Divider()
-            Button("Take Screenshot") { model.saveScreenshot(ui: ui) }
-            Button("Rotate") { model.controller.rotate() }
-            Toggle("Phone Screen Off", isOn: Binding(get: { model.phoneScreenOff }, set: { model.setPhoneScreenOff($0) }))
-            Button("Lock Phone") { model.controller.key(AKey.power) }
-            Button("Unlock") { model.unlockPhone() }
-            Divider()
-            Menu("Volume") {
-                Button("Volume Up") { model.controller.key(AKey.volumeUp) }
-                Button("Volume Down") { model.controller.key(AKey.volumeDown) }
-                Button("Mute") { model.controller.key(AKey.volumeMute) }
-            }
-            if let d = controller.device, d.transports.count > 1 {
-                Menu("Connection") {
-                    ForEach(d.transports) { t in
-                        Button {
-                            model.controller.switchTo(serial: t.serial)
-                        } label: {
-                            Text((t.serial == controller.activeTransport?.serial ? "✓ " : "") + t.label)
-                        }
-                    }
-                }
-            }
-            Divider()
-            Button("Disconnect") { model.disconnect() }
         } label: {
             Image(systemName: "ellipsis.circle").font(.system(size: 14))
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help("More")
+        .help("Mirror controls")
+        .accessibilityLabel("Mirror controls")
+    }
+
+    @ViewBuilder private var phoneControls: some View {
+        if let t = controller.activeTransport {
+            Text("\(t.kind.label) · \(controller.stats.codec) · \(Int(controller.stats.fps)) fps")
+            if let ms = t.rttMs { Text("Latency: \(Int(ms)) ms") }
+            Divider()
+        }
+        Button("Notifications") { model.controller.expandNotifications() }
+        Button("Quick Settings") { model.controller.expandSettings() }
+        Divider()
+        Button("Take Screenshot") { model.saveScreenshot(ui: ui) }
+        Button("Rotate") { model.controller.rotate() }
+        Toggle("Phone Screen Off", isOn: Binding(get: { model.phoneScreenOff }, set: { model.setPhoneScreenOff($0) }))
+        Button("Lock Phone") { model.controller.key(AKey.power) }
+        Button("Unlock") { model.unlockPhone() }
+        Divider()
+        Menu("Volume") {
+            Button("Volume Up") { model.controller.key(AKey.volumeUp) }
+            Button("Volume Down") { model.controller.key(AKey.volumeDown) }
+            Button("Mute") { model.controller.key(AKey.volumeMute) }
+        }
+        if let d = controller.device, d.transports.count > 1 {
+            Menu("Connection") {
+                ForEach(d.transports) { t in
+                    Button {
+                        model.controller.switchTo(serial: t.serial)
+                    } label: {
+                        Text((t.serial == controller.activeTransport?.serial ? "✓ " : "") + t.label)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -190,6 +203,7 @@ struct MirrorOverlay: View {
     @ObservedObject var controller: MirrorController
     @ObservedObject var model: AppModel
     @ObservedObject var ui: WindowUIState
+    @ObservedObject var devices: DeviceManager
 
     var body: some View {
         ZStack {
@@ -221,11 +235,11 @@ struct MirrorOverlay: View {
     @ViewBuilder private var statusLayer: some View {
         switch controller.state {
         case .streaming:
-            if controller.frameSize == .zero { card(spinner: true, title: phoneName, detail: "Starting video…") }
+            if !controller.hasVideo { connectionCard(title: "Connecting to \(model.selectedPhoneName)", detail: "Starting video…") }
         case .connecting(let detail):
-            card(spinner: true, title: phoneName, detail: detail)
+            connectionCard(title: "Connecting to \(model.selectedPhoneName)", detail: detail)
         case .reconnecting(let detail):
-            card(spinner: true, title: "Reconnecting", detail: detail, dim: 0.55)
+            connectionCard(title: "Reconnecting to \(model.selectedPhoneName)", detail: detail)
         case .failed(let msg):
             card(spinner: false, title: "Couldn't connect", detail: msg) {
                 Button("Try Again") { model.reconnect() }.buttonStyle(.borderedProminent)
@@ -233,20 +247,26 @@ struct MirrorOverlay: View {
             }
         case .idle:
             card(spinner: false, title: "Not connected", detail: model.idleHint) {
-                if model.canQuickConnect {
-                    Button("Connect") { model.reconnect() }.buttonStyle(.borderedProminent)
+                if let phone = model.preferredPhone {
+                    let verb = devices.device(id: phone.id) == nil ? "Reconnect" : "Open"
+                    Button("\(verb) \(phone.name)") { model.connect(phone.id) }.buttonStyle(.borderedProminent)
                 }
-                Button("Phones…") { model.showDevices() }.buttonStyle(.bordered)
+                Button("Choose Phone…") { model.showDevices() }.buttonStyle(.bordered)
             }
         }
     }
 
-    private var phoneName: String { controller.device?.name ?? "Android Phone" }
+    private func connectionCard(title: String, detail: String) -> some View {
+        card(spinner: true, title: title, detail: detail) {
+            Button("Cancel") { model.disconnect() }.buttonStyle(.bordered)
+            Button("Choose Phone…") { model.showDevices() }.buttonStyle(.bordered)
+        }
+    }
 
-    private func card<Buttons: View>(spinner: Bool, title: String, detail: String, dim: Double = 1,
+    private func card<Buttons: View>(spinner: Bool, title: String, detail: String,
                                      @ViewBuilder buttons: () -> Buttons = { EmptyView() }) -> some View {
         ZStack {
-            Rectangle().fill(.black.opacity(dim))
+            Rectangle().fill(.black)
             VStack(spacing: 14) {
                 Image(systemName: "smartphone")
                     .font(.system(size: 42, weight: .thin))
@@ -261,7 +281,7 @@ struct MirrorOverlay: View {
                         .lineLimit(4)
                 }
                 if spinner { ProgressView().controlSize(.small) }
-                HStack(spacing: 8) { buttons() }.controlSize(.regular)
+                VStack(spacing: 8) { buttons() }.controlSize(.regular)
             }
             .padding(24)
         }

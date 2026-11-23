@@ -348,7 +348,7 @@ public struct MDNSService: Hashable, Sendable {
 
     public var isPairing: Bool { type.contains("pairing") }
 
-    static func parse(_ text: String) -> [MDNSService] {
+    public static func parse(_ text: String) -> [MDNSService] {
         text.split(separator: "\n").compactMap { line in
             let parts = line.split(whereSeparator: { $0 == "\t" || $0 == " " }).map(String.init)
             guard parts.count >= 3 else { return nil }

@@ -82,16 +82,14 @@ covers building from `HEAD`, agent setup, upgrades, and tap trust prompts.
 
 ## Connect your phone
 
-1. Enable Developer options and USB debugging on Android. For wireless pairing,
-   Android 11 or later also needs **Wireless debugging**, with phone and Mac on
-   the same Wi-Fi network during pairing.
-2. Open the app's **Phones** window with **Shift-Command-P**. Scan its pairing QR
-   code from Android's Wireless debugging screen, or enter the pairing address
-   and code shown by the phone. A pairing port and a connection port can differ.
-3. Alternatively, attach USB and accept the debugging authorization prompt.
-   Select the phone to start mirroring.
+Open **Phones** (**Shift-Command-P**) and choose **USB** or **Wi-Fi** under
+**Connect a Phone**. The app shows how to enable Developer options and which
+prompt to look for on Android. Wi-Fi pairing needs Android 11 or later and both
+devices on the same Wi-Fi network. A pairing port and a connection port can differ.
 
-The app remembers known endpoints and reconnects. For Tailscale, the phone needs
+Saved phones stay in the list even when offline. Select **Reconnect** to wait
+for one, **Cancel** to stop waiting, or select another available phone.
+For Tailscale, choose **Advanced**; the phone needs
 a reachable ADB endpoint; installing Tailscale alone does not enable remote ADB.
 See [connection and troubleshooting](docs/connections.md) for changing ports,
 remote ADB servers, and authorization problems.
@@ -148,8 +146,11 @@ one to your phone.
 | Command-R / Command-L | Rotate / lock |
 | Option-Command-O | Toggle the phone display |
 | Shift-Command-S | Save a screenshot to Desktop |
+| Shift-Command-T | Keep mirror controls visible |
 
-The Settings window includes the full shortcuts list.
+The Settings window includes the full shortcuts list. While mirroring, choose
+**Phone → Manage Favorite Apps** to star Android apps. Open them directly from
+**Favorite Apps** in the Android Mirroring menu bar menu.
 
 ## Development
 

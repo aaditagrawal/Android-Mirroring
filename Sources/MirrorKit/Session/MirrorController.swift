@@ -20,6 +20,7 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
     @Published public private(set) var device: PhoneDevice?
     @Published public private(set) var activeTransport: Transport?
     @Published public private(set) var frameSize: CGSize = .zero
+    @Published public private(set) var hasVideo = false
     @Published public private(set) var stats = StreamStats()
     @Published public private(set) var lastSwitchReason: String?
 
@@ -78,17 +79,29 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
     /// Start mirroring a phone; keeps it connected (failover + reconnect) until `disconnect()`.
     public func connect(deviceId: String) {
         DispatchQueue.main.async { [self] in
+            if wantedDeviceId != deviceId {
+                generation += 1
+                startInFlight = false
+                stopHealth()
+                let old = session
+                session = nil
+                sessionQueue.async { old?.stop() }
+                hasVideo = false
+                frames.clear()
+                frameSize = .zero
+                activeTransport = nil
+            }
             wantedDeviceId = deviceId
             devices.focusDeviceId = deviceId
             reconnectAttempt = 0
             reconnectGeneration = nil
-            if let d = devices.device(id: deviceId) {
-                device = d
+            device = devices.device(id: deviceId)
+            if let d = device {
                 waitingForDevice = false
                 startSession(on: d, reason: nil)
             } else {
                 waitingForDevice = true
-                state = .connecting("Looking for your phone…")
+                state = .reconnecting("Connect by USB or turn on Wireless debugging on the same Wi-Fi.")
             }
         }
     }
@@ -96,6 +109,7 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
     public func disconnect() {
         DispatchQueue.main.async { [self] in
             wantedDeviceId = nil
+            devices.focusDeviceId = nil
             generation += 1
             startInFlight = false
             stopHealth()
@@ -106,6 +120,8 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
             }
             sessionQueue.async { s?.stop() }
             activeTransport = nil
+            device = nil
+            hasVideo = false
             state = .idle
             frames.clear()
             clipboardTimer?.invalidate()
@@ -115,7 +131,7 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
     /// Restart the stream with current settings (after a settings change).
     public func restart() {
         DispatchQueue.main.async { [self] in
-            guard let d = device ?? wantedDeviceId.flatMap(devices.device(id:)) else { return }
+            guard let id = wantedDeviceId, let d = devices.device(id: id) else { return }
             startSession(on: d, reason: "Applying settings")
         }
     }
@@ -203,6 +219,8 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
     private func startSession(on d: PhoneDevice, reason: String?, excluding: Set<String> = []) {
         generation += 1
         let gen = generation
+        hasVideo = false
+        activeTransport = nil
         let old = session
         session = nil
         stopHealth()
@@ -239,11 +257,15 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
                         guard gen == self.generation else { return }
                         self.reconnectAttempt = 0
                         self.startFailures[t.serial] = nil
+                        self.hasVideo = true
                     }
                 }
             }
             s.onFrameSize = { [weak self] w, h in
-                DispatchQueue.main.async { self?.frameSize = CGSize(width: w, height: h) }
+                DispatchQueue.main.async {
+                    guard let self, gen == self.generation else { return }
+                    self.frameSize = CGSize(width: w, height: h)
+                }
             }
             s.onStats = { [weak self] st in DispatchQueue.main.async { self?.stats = st } }
             s.onClipboard = { [weak self] text in self?.clipboardFromDevice(text) }
@@ -290,6 +312,8 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
     private func sessionClosed(gen: Int, serial: String, reason: String?) {
         guard gen == generation, wantedDeviceId != nil else { return }
         session = nil
+        hasVideo = false
+        activeTransport = nil
         devices.reportFailure(serial: serial)
         scheduleReconnect(after: reason ?? "stream ended", failedSerial: serial)
     }
@@ -307,7 +331,7 @@ public final class MirrorController: ObservableObject, @unchecked Sendable {
             self.reconnectGeneration = nil
             guard let d = self.devices.device(id: id), d.isOnline else {
                 self.waitingForDevice = true
-                self.state = .reconnecting("Waiting for \(self.device?.name ?? "phone")…")
+                self.state = .reconnecting("Connect by USB or check that Wireless debugging is on and both devices are on the same Wi-Fi.")
                 return
             }
             // Prefer a different path than the one that just failed, if one exists.

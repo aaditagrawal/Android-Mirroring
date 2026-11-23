@@ -53,6 +53,28 @@ struct AgentTests {
         }
     }
 
+    @Test func testUnavailablePhoneCanBeCancelled() async {
+        let controller = MirrorController(devices: DeviceManager())
+        controller.connect(deviceId: UUID().uuidString)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        guard case .reconnecting = controller.state else {
+            Issue.record("Expected an unavailable phone to enter recovery")
+            return
+        }
+        #expect(!controller.hasVideo)
+
+        controller.disconnect()
+        controller.restart()
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        #expect(controller.state == .idle)
+        #expect(!controller.hasVideo)
+        #expect(controller.serial == nil)
+    }
+
     @Test func testNegativeTextMatchIndexFailsBeforeAccessingPhone() {
         do {
             _ = try server(path: "/tmp/unused.sock").handleObservation(

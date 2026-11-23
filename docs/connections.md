@@ -7,15 +7,19 @@ Use a cable that carries data. An `unauthorized` device cannot be mirrored until
 the phone accepts the Mac's ADB key.
 
 For Android 11 or later, enable Wireless debugging in Developer options.
-Phones → QR Code advertises a pairing service. Scan it using **Pair device with
-QR code** on the phone. Pairing by code uses the address, port, and six-digit code
-in **Pair device with pairing code**. After pairing, use the connection endpoint
-from the main Wireless debugging screen. That port may differ from the pairing
-port and can change when wireless debugging restarts.
+In **Phones → Wi-Fi**, scan the QR code using **Pair device with QR code** on
+Android, or choose **Use a Pairing Code Instead** and enter the address and
+six-digit code shown by the phone. If pairing succeeds but the phone does not
+appear as ready, use **Enter Connection Address** with the address on the main
+Wireless debugging screen. That port may differ from the pairing port and can
+change when wireless debugging restarts.
 
 The app discovers ADB services with Bonjour and remembers successful endpoints.
 If discovery fails, enter the connection address manually. The Mac may need
 Local Network access in System Settings.
+
+Remembered phones remain in **Phones** when offline. You can reconnect, cancel
+while waiting, or select another phone without pairing the first one again.
 
 Older phones can use USB first, then `adb -s DEVICE_SERIAL tcpip 5555`, followed
 by a connection to `PHONE_IP:5555`. This enables a network debugging endpoint.
